@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>12</LangVersion>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>Lidarr.Plugin.YtDlp</RootNamespace>
+    <AssemblyName>Lidarr.Plugin.YtDlp</AssemblyName>
+    <Description>Lidarr plugin: YouTube downloader/indexer backed by an existing yt-dlp installation, with SponsorBlock filtering.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="CliWrap" Version="3.7.1" />
+  </ItemGroup>
+
+</Project>
