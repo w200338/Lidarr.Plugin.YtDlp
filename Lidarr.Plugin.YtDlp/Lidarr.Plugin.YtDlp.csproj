@@ -27,4 +27,9 @@
     <None Include="..\plugin.json" Link="plugin.json" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- Unit tests reach internal seams (settings external-test hook, parser helpers). -->
+    <InternalsVisibleTo Include="Lidarr.Plugin.YtDlp.Tests" />
+  </ItemGroup>
+
 </Project>

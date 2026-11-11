@@ -15,6 +15,9 @@ public sealed class YtDlpSettingsProvider : ISettingsProvider
     private readonly YtDlpSettingsValidator _validator = new();
     private YtDlpSettings _current;
 
+    private (string Path, DateTime AtUtc, PluginValidationResult Result)? _externalCache;
+    private static readonly TimeSpan ExternalCacheTtl = TimeSpan.FromSeconds(60);
+
     public YtDlpSettingsProvider()
         : this(new YtDlpSettings())
     {
@@ -24,6 +27,16 @@ public sealed class YtDlpSettingsProvider : ISettingsProvider
     {
         _current = initial.Clone();
     }
+
+    /// <summary>
+    /// Optional LIVE connection test (Phase 5): run after pure validation
+    /// succeeds, only when a ytDlpPath is present. The host calls Validate
+    /// synchronously, so the hook must be synchronous and bounded; results are
+    /// cached per path for <see cref="ExternalCacheTtl"/> so rapid re-saves don't
+    /// re-probe. Wired by the plugin; null in unit tests (pure behavior only).
+    /// Exceptions from the hook degrade to a warning, never a save failure.
+    /// </summary>
+    internal Func<YtDlpSettings, PluginValidationResult>? ExternalConnectionTest { get; set; }
 
     /// <summary>Most recently applied settings snapshot.</summary>
     public YtDlpSettings Current
@@ -56,13 +69,61 @@ public sealed class YtDlpSettingsProvider : ISettingsProvider
             return PluginValidationResult.Failure(errors);
         }
 
-        var result = _validator.Validate(mapped);
-        if (result.IsValid)
+        var pure = _validator.Validate(mapped);
+        if (!pure.IsValid)
         {
-            return PluginValidationResult.Success();
+            return PluginValidationResult.Failure(pure.Errors.Select(e => e.ErrorMessage));
         }
 
-        return PluginValidationResult.Failure(result.Errors.Select(e => e.ErrorMessage));
+        if (!string.IsNullOrWhiteSpace(mapped.YtDlpPath) && ExternalConnectionTest is { } external)
+        {
+            return MergeExternal(mapped, external);
+        }
+
+        return PluginValidationResult.Success();
+    }
+
+    /// <summary>
+    /// Runs the live test (cached per path) and merges its findings into a
+    /// passing pure-validation result: external errors fail the validation,
+    /// hook crashes degrade to a warning.
+    /// </summary>
+    private PluginValidationResult MergeExternal(YtDlpSettings settings, Func<YtDlpSettings, PluginValidationResult> external)
+    {
+        PluginValidationResult externalResult;
+        lock (_lock)
+        {
+            var cached = _externalCache;
+            if (cached is { } c
+                && c.Path == settings.YtDlpPath
+                && DateTime.UtcNow - c.AtUtc < ExternalCacheTtl)
+            {
+                externalResult = c.Result;
+            }
+            else
+            {
+                externalResult = RunExternalGuarded(settings, external);
+                _externalCache = (settings.YtDlpPath, DateTime.UtcNow, externalResult);
+            }
+        }
+
+        return externalResult.IsValid
+            ? PluginValidationResult.Success(externalResult.Warnings.ToArray())
+            : PluginValidationResult.Failure(externalResult.Errors, externalResult.Warnings);
+    }
+
+    private static PluginValidationResult RunExternalGuarded(YtDlpSettings settings, Func<YtDlpSettings, PluginValidationResult> external)
+    {
+        try
+        {
+            return external(settings);
+        }
+        catch (Exception ex)
+        {
+            // The live test itself crashed (plugin bug, not user config) —
+            // surface as a warning; never block a save on it.
+            return PluginValidationResult.Success(new[] { $"connection test failed to run: {ex.Message}" });
+        }
     }
 
     public PluginValidationResult Apply(IDictionary<string, object?> settings)

@@ -1,6 +1,30 @@
 # PHASE 5: Connection test, SponsorBlock probe, validation polish
 
-STATUS: PENDING
+STATUS: COMPLETED (2026-11-11)
+
+## Implementation notes (deviations from the plan above)
+- **Synchronous Validate hook design.** `ISettingsProvider.Validate` is synchronous and
+  `IPlugin.InitializeAsync` returns a bare `ValueTask` (no result), so there is no
+  dedicated "TestConnection" RPC in the contract. The live test is surfaced through
+  two paths:
+  1. `YtDlpPlugin.InitializeAsync` runs `YtDlpConnectionTester` once at load
+     (async, no video probe), caches it in `YtDlpPlugin.LastConnectionTest`, and logs
+     failures.
+  2. `YtDlpSettingsProvider.ExternalConnectionTest` (internal hook) runs on every
+     `Validate`/`Apply` after pure validation passes and a `ytDlpPath` is present.
+     It is wrapped in a 15s `CancellationTokenSource` (a wedged binary can't hang a
+     settings save; timeout → warning only), results are cached per path for 60s so
+     rapid re-saves don't re-probe, and hook crashes degrade to a warning — a save
+     is never blocked by the test itself.
+- **Fresh runner per live test.** `CliWrapYtDlpRunner` is bound to a binary path, so
+  `YtDlpPlugin.RunLiveTestAsync` builds fresh runners for the (possibly changed)
+  configured path on each probe; the indexer/download-client factories share one
+  runner per path via `YtDlpPlugin._runnerByPath`.
+- **Client name:** `SponsorBlockClient` (not `SponsorBlockHttpClient`) — HttpClient is
+  injectable, `IDisposable` disposes only when it owns the client. Request timeout is
+  a ctor parameter (default 10s, testable) implemented via a linked CTS.
+- **ffmpeg check** runs `ffmpeg -version` through a second path-bound runner
+  (yt-dlp's runner is bound to the yt-dlp binary); PATH-only, no setting.
 
 ## Goal
 Make the plugin "testable" in the Lidarr UI: `InitializeAsync` (and a dedicated

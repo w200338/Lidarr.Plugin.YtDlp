@@ -3,22 +3,30 @@ using Lidarr.Plugin.Abstractions.Contracts;
 using Lidarr.Plugin.Abstractions.Manifest;
 using Lidarr.Plugin.YtDlp.Download;
 using Lidarr.Plugin.YtDlp.Indexing;
+using Lidarr.Plugin.YtDlp.Probing;
 using Lidarr.Plugin.YtDlp.Runner;
 using Lidarr.Plugin.YtDlp.Settings;
+using Lidarr.Plugin.YtDlp.SponsorBlock;
 using Microsoft.Extensions.Logging;
 
 namespace Lidarr.Plugin.YtDlp;
 
 /// <summary>
 /// Plugin entry point discovered by the Lidarr host via <c>plugin.json</c>
-/// (main = this assembly). The download client is live (Phase 3); the indexer
-/// arrives in Phase 4 (factory returns null = capability unavailable).
+/// (main = this assembly). Indexer (Phase 4) and download client (Phase 3)
+/// are live; connection testing (Phase 5) runs once at load (async) and on
+/// every settings save (synchronous hook with per-path caching).
 /// </summary>
 public sealed class YtDlpPlugin : IPlugin
 {
+    /// <summary>Bounded guard for the synchronous live test inside Validate/Apply.</summary>
+    private static readonly TimeSpan SyncTestTimeout = TimeSpan.FromSeconds(15);
+
     private readonly object _stateLock = new();
+    private readonly Dictionary<string, IYtDlpRunner> _runnerByPath = new(StringComparer.Ordinal);
     private IPluginContext? _context;
     private YtDlpSettingsProvider? _settingsProvider;
+    private PluginValidationResult? _lastConnectionTest;
 
     public PluginManifest Manifest { get; }
 
@@ -28,10 +36,19 @@ public sealed class YtDlpPlugin : IPlugin
         {
             lock (_stateLock)
             {
-                _settingsProvider ??= new YtDlpSettingsProvider();
+                _settingsProvider ??= CreateSettingsProvider();
                 return _settingsProvider;
             }
         }
+    }
+
+    /// <summary>
+    /// Result of the most recent live connection test (null before
+    /// InitializeAsync has run with a configured path, or if the path was empty).
+    /// </summary>
+    public PluginValidationResult? LastConnectionTest
+    {
+        get { lock (_stateLock) { return _lastConnectionTest; } }
     }
 
     public YtDlpPlugin()
@@ -45,7 +62,7 @@ public sealed class YtDlpPlugin : IPlugin
         Manifest = LoadManifest(manifestPath);
     }
 
-    public ValueTask InitializeAsync(IPluginContext context, CancellationToken cancellationToken = default)
+    public async ValueTask InitializeAsync(IPluginContext context, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(context);
         lock (_stateLock)
@@ -53,27 +70,50 @@ public sealed class YtDlpPlugin : IPlugin
             _context = context;
         }
 
-        return ValueTask.CompletedTask;
+        // One-shot live check at load (async; no video probe — that can take
+        // up to 30s and belongs to the settings "Test", not to plugin load).
+        if (SettingsProvider is YtDlpSettingsProvider { Current: { YtDlpPath.Length: > 0 } settings })
+        {
+            try
+            {
+                var result = await RunLiveTestAsync(settings, probeUrl: null, cancellationToken).ConfigureAwait(false);
+                lock (_stateLock)
+                {
+                    _lastConnectionTest = result;
+                }
+
+                if (result.IsValid)
+                {
+                    Logger?.LogInformation("yt-dlp connection test passed.");
+                }
+                else
+                {
+                    foreach (var error in result.Errors)
+                    {
+                        Logger?.LogWarning("yt-dlp connection test: {Error}", error);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger?.LogWarning(ex, "yt-dlp connection test failed to run");
+            }
+        }
     }
 
     public ValueTask<IIndexer?> CreateIndexerAsync(CancellationToken cancellationToken = default)
     {
-        // Phase 4: return the yt-dlp search indexer. Structural guards mirror the
-        // download client (Phase 5 adds the live yt-dlp probe).
+        // Structural guards mirror the download client (Phase 5 adds the live probe).
         lock (_stateLock)
         {
-            if (SettingsProvider is not YtDlpSettingsProvider provider
-                || provider.Current is not { } settings
-                || string.IsNullOrWhiteSpace(settings.YtDlpPath)
-                || settings.MinDownloadDelaySeconds > settings.MaxDownloadDelaySeconds)
+            if (TryGetConfiguredSettings(out var settings))
             {
-                return ValueTask.FromResult<IIndexer?>(null);
+                return ValueTask.FromResult<IIndexer?>(
+                    new YtDlpIndexer(settings, GetRunner(settings.YtDlpPath),
+                        _context?.LoggerFactory?.CreateLogger<YtDlpIndexer>()));
             }
 
-            var runner = new CliWrapYtDlpRunner(settings.YtDlpPath);
-            var logger = _context?.LoggerFactory?.CreateLogger<YtDlpIndexer>();
-            return ValueTask.FromResult<IIndexer?>(
-                new YtDlpIndexer(settings, runner, logger));
+            return ValueTask.FromResult<IIndexer?>(null);
         }
     }
 
@@ -81,18 +121,13 @@ public sealed class YtDlpPlugin : IPlugin
     {
         lock (_stateLock)
         {
-            // Settings flow: the host calls Apply on our stable SettingsProvider
-            // instance (see ISettingsProvider); the factory then reads the
-            // validated snapshot from it. IPluginContext carries no settings.
-            if (SettingsProvider is not YtDlpSettingsProvider provider
-                || provider.Current is not { } settings
-                || string.IsNullOrWhiteSpace(settings.YtDlpPath))
+            if (TryGetConfiguredSettings(out var settings))
             {
-                return ValueTask.FromResult<IDownloadClient?>(null);
+                return ValueTask.FromResult<IDownloadClient?>(
+                    new YtDlpDownloadClient(settings, GetRunner(settings.YtDlpPath)));
             }
 
-            var runner = new CliWrapYtDlpRunner(settings.YtDlpPath);
-            return ValueTask.FromResult<IDownloadClient?>(new YtDlpDownloadClient(settings, runner));
+            return ValueTask.FromResult<IDownloadClient?>(null);
         }
     }
 
@@ -113,9 +148,78 @@ public sealed class YtDlpPlugin : IPlugin
         lock (_stateLock)
         {
             _context = null;
+            _lastConnectionTest = null;
         }
 
         return ValueTask.CompletedTask;
+    }
+
+    // ----- internals -----
+
+    private bool TryGetConfiguredSettings(out YtDlpSettings settings)
+    {
+        settings = default!;
+        if (SettingsProvider is not YtDlpSettingsProvider provider
+            || provider.Current is not { } current
+            || string.IsNullOrWhiteSpace(current.YtDlpPath)
+            || current.MinDownloadDelaySeconds > current.MaxDownloadDelaySeconds)
+        {
+            return false;
+        }
+
+        settings = current;
+        return true;
+    }
+
+    /// <summary>One <see cref="IYtDlpRunner"/> per binary path (shared by indexer + client).</summary>
+    private IYtDlpRunner GetRunner(string ytDlpPath)
+    {
+        if (!_runnerByPath.TryGetValue(ytDlpPath, out var runner))
+        {
+            runner = new CliWrapYtDlpRunner(ytDlpPath);
+            _runnerByPath[ytDlpPath] = runner;
+        }
+
+        return runner;
+    }
+
+    private YtDlpSettingsProvider CreateSettingsProvider()
+    {
+        var provider = new YtDlpSettingsProvider();
+        provider.ExternalConnectionTest = settings =>
+        {
+            // The host calls Validate synchronously — bound the live test so a
+            // wedged binary can't hang a settings save. Timeout → warning only.
+            using var cts = new CancellationTokenSource(SyncTestTimeout);
+            try
+            {
+                return RunLiveTestAsync(settings, probeUrl: null, cts.Token).GetAwaiter().GetResult();
+            }
+            catch (OperationCanceledException)
+            {
+                return PluginValidationResult.Success(
+                    new[] { $"connection test timed out after {(int)SyncTestTimeout.TotalSeconds}s; please verify the settings manually." });
+            }
+        };
+
+        return provider;
+    }
+
+    /// <summary>
+    /// Builds a fresh probe chain for the given settings (runners are bound to
+    /// the configured binary path, so they must track setting changes) and runs
+    /// the full test: yt-dlp → ffmpeg (when needed) → SponsorBlock (when enabled).
+    /// </summary>
+    internal static async Task<PluginValidationResult> RunLiveTestAsync(
+        YtDlpSettings settings, string? probeUrl, CancellationToken ct)
+    {
+        using var sponsorBlock = new SponsorBlockClient();
+        var probe = new YtDlpProbe(
+            new CliWrapYtDlpRunner(settings.YtDlpPath),
+            new CliWrapYtDlpRunner("ffmpeg"),
+            settings.YtDlpPath);
+        var tester = new YtDlpConnectionTester(probe, sponsorBlock);
+        return await tester.TestAsync(settings, probeUrl, ct).ConfigureAwait(false);
     }
 
     internal static PluginManifest LoadManifest(string manifestPath)
