@@ -1,4 +1,4 @@
-STATUS: COMPLETE (2026-11-11)
+STATUS: COMPLETE (2026-11-11) — RESOLVED via native-model port, see `07-native-model-port.md` and `docs/plans/PHASE-7-native-port.md`
 
 # Plugin install investigation — why a GitLab-URL install leaves nothing installed
 
@@ -9,8 +9,9 @@ required to install the plugin" modal, and after restarting the plugin was not p
 many `IndexerRepository/DownloadClientRepository: Skipping provider of unknown type ...` warnings
 and `PluginCheck: Status: Unhealthy, Plugins failed to load or are not enabled`.
 
-Research basis: the public `Lidarr/Lidarr` source at stable tag `v3.2.1.5196` (the "current
-stable release" the user reports running) and at the `plugins` branch (`e42a7ca4`), the public
+Research basis: the public `Lidarr/Lidarr` source at the user's actual host version, stable tag
+`v3.1.6.5079` (verified: byte-identical plugin subsystem to `v3.2.1.5196`, which is a
+pre-release; see doc 07 §2) and at the `plugins` branch (`e42a7ca4`), the public
 `TypNull/Tubifarry` repository (the plugin the user successfully runs, whose provider types match
 the log warnings exactly), and this repo's own `docs/research/01-lidarr-plugin-guides.md` plus
 `ext/Lidarr.Plugin.Common` source for the Abstractions/host model. The user's GitLab instance
