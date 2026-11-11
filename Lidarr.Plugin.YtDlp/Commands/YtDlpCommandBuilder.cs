@@ -11,11 +11,14 @@ namespace Lidarr.Plugin.YtDlp.Commands;
 public sealed class YtDlpCommandBuilder
 {
     /// <summary>
-    /// Pipe-delimited print template for search/album listing.
-    /// Field order is the parse contract: id | url | title | channel | duration | type.
-    /// (The parser splits from both ends because title may contain '|'.)
+    /// Per-entry JSON print template for search/album listing: each entry is one
+    /// line of compact JSON with the keys {id, url, title, channel, duration, type}.
+    /// JSON (not a pipe-delimited template) because '|' is a reserved yt-dlp
+    /// template separator and cannot be escaped — titles like "Song | Live" would
+    /// corrupt a pipe split. JSON escaping makes the parse unambiguous.
+    /// Missing keys come through as JSON null; the parser treats them as absent.
     /// </summary>
-    public const string PrintTemplate = "%(id)s|%(url)s|%(title)s|%(channel)s|%(duration)s|%(type)s";
+    public const string PrintTemplate = "%(.{id,url,title,channel,duration,type})j";
 
     public IReadOnlyList<string> BuildVersionArgs() =>
     [

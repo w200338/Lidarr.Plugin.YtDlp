@@ -2,6 +2,7 @@ using System.Text.Json;
 using Lidarr.Plugin.Abstractions.Contracts;
 using Lidarr.Plugin.Abstractions.Manifest;
 using Lidarr.Plugin.YtDlp.Download;
+using Lidarr.Plugin.YtDlp.Indexing;
 using Lidarr.Plugin.YtDlp.Runner;
 using Lidarr.Plugin.YtDlp.Settings;
 using Microsoft.Extensions.Logging;
@@ -57,8 +58,23 @@ public sealed class YtDlpPlugin : IPlugin
 
     public ValueTask<IIndexer?> CreateIndexerAsync(CancellationToken cancellationToken = default)
     {
-        // Phase 4: return the yt-dlp search indexer.
-        return ValueTask.FromResult<IIndexer?>(null);
+        // Phase 4: return the yt-dlp search indexer. Structural guards mirror the
+        // download client (Phase 5 adds the live yt-dlp probe).
+        lock (_stateLock)
+        {
+            if (SettingsProvider is not YtDlpSettingsProvider provider
+                || provider.Current is not { } settings
+                || string.IsNullOrWhiteSpace(settings.YtDlpPath)
+                || settings.MinDownloadDelaySeconds > settings.MaxDownloadDelaySeconds)
+            {
+                return ValueTask.FromResult<IIndexer?>(null);
+            }
+
+            var runner = new CliWrapYtDlpRunner(settings.YtDlpPath);
+            var logger = _context?.LoggerFactory?.CreateLogger<YtDlpIndexer>();
+            return ValueTask.FromResult<IIndexer?>(
+                new YtDlpIndexer(settings, runner, logger));
+        }
     }
 
     public ValueTask<IDownloadClient?> CreateDownloadClientAsync(CancellationToken cancellationToken = default)

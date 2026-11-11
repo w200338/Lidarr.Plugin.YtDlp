@@ -1,6 +1,27 @@
 # PHASE 4: Indexer (search via yt-dlp)
 
-STATUS: PENDING
+STATUS: COMPLETED (2026-11-11)
+
+## Implementation notes (deviations from the plan above)
+- **Parse contract: JSON-per-line, not pipe-delimited.** The plan assumed
+  `id|url|title|channel|duration|type` with careful left/right anchoring. That is
+  unworkable: `|` is a *reserved* separator in yt-dlp print templates (`|default)`
+  syntax) and cannot be escaped or substituted per-character, so a title like
+  `Song | Live` would corrupt any pipe split. Switched `YtDlpCommandBuilder.PrintTemplate`
+  to `%(.{id,url,title,channel,duration,type})j` — one compact JSON object per line —
+  which makes the parse unambiguous (JSON escaping handles `|`, quotes, newlines,
+  unicode). `Indexing/SearchLineParser` parses/skips lines; P2 builder test updated.
+- **`GetAlbumAsync` uses `-J` probes, not flat `--print`.** The `--flat-playlist -J`
+  probe (already built in P3 as `BuildPlaylistProbeArgs`) returns the playlist title,
+  owner, AND the entry array in one call — strictly more than flat `--print` (which
+  lacks the playlist-level title) at the same cost, so the P5 refinement is unnecessary.
+  Single-video tokens use `BuildProbeArgs`. Both are rate-limited through the same
+  single-flight semaphore as search.
+- **Tracks live in `Metadata["ytdlp.tracks"]`.** `StreamingAlbum` has no track-list
+  property in the Abstractions model, so expanded tracks (with `TrackNumber`) are
+  attached under the `ytdlp.tracks` metadata key (values are Abstractions model
+  objects — ALC-safe). `TrackCount` is set correctly; album search results carry
+  `TrackCount = 0` until `GetAlbumAsync` expands them.
 
 ## Goal
 `IIndexer` implementation: search YouTube for tracks and albums using yt-dlp and map

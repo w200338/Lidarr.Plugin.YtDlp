@@ -203,9 +203,11 @@ public class YtDlpCommandBuilderTests
     }
 
     [Test]
-    public void PrintTemplate_field_order_is_the_parse_contract()
+    public void PrintTemplate_is_per_entry_json()
     {
+        // One compact JSON object per line; '|' can't be a field separator in a
+        // yt-dlp template (reserved) so titles containing '|' would corrupt it.
         Assert.That(YtDlpCommandBuilder.PrintTemplate,
-            Is.EqualTo("%(id)s|%(url)s|%(title)s|%(channel)s|%(duration)s|%(type)s"));
+            Is.EqualTo("%(.{id,url,title,channel,duration,type})j"));
     }
 }
