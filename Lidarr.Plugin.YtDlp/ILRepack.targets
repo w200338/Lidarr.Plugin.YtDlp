@@ -1,0 +1,50 @@
+<Project>
+  <!--
+    This file is REQUIRED by the ILRepack.Lib.MSBuild.Task package design:
+    when a project-local ILRepack.targets exists, the package's built-in
+    fallback target is suppressed. That fallback merges EVERY dll in the
+    output directory into the plugin — including host-shared
+    Lidarr.Plugin.Abstractions and Microsoft.Extensions.* — which splits
+    type identity across the host's collectible AssemblyLoadContext and
+    breaks the plugin at runtime with MissingMethodException.
+
+    Instead we run a controlled, incremental merge:
+      * primary  = the freshly compiled assembly (obj), copied to bin first
+      * merged in = CliWrap + FluentValidation only (internalized + renamed)
+      * host-shared assemblies (Lidarr.Plugin.Abstractions,
+        M.E.Logging.Abstractions, M.E.DependencyInjection.Abstractions)
+        stay external so the host's PluginLoadContext keeps a single
+        type identity across the ALC boundary
+      * a stamp file makes the merge skip when up-to-date, so an
+        already-merged bin dll is never re-merged with the sidecars
+  -->
+  <Target Name="MergePluginDependencies"
+          AfterTargets="Build"
+          Condition="'$(Configuration)' == 'Release' and '$(SkipMerge)' != 'true' and '$(IsCrossTargetingBuild)' != 'true'"
+          Inputs="$(IntermediateOutputPath)Lidarr.Plugin.YtDlp.dll;$(TargetDir)CliWrap.dll;$(TargetDir)FluentValidation.dll"
+          Outputs="$(IntermediateOutputPath)plugin-merge.stamp">
+    <Copy SourceFiles="$(IntermediateOutputPath)Lidarr.Plugin.YtDlp.dll"
+          DestinationFiles="$(TargetDir)Lidarr.Plugin.YtDlp.dll" />
+    <ItemGroup>
+      <_MergeInput Include="$(TargetDir)Lidarr.Plugin.YtDlp.dll" />
+      <_MergeInput Include="$(TargetDir)CliWrap.dll" />
+      <_MergeInput Include="$(TargetDir)FluentValidation.dll" />
+    </ItemGroup>
+    <ILRepack
+      InputAssemblies="@(_MergeInput)"
+      LibraryPath="$(TargetDir)"
+      Internalize="true"
+      RenameInternalized="true"
+      InternalizeAssembly="CliWrap;FluentValidation"
+      InternalizeExclude="System.*"
+      OutputFile="$(TargetDir)Lidarr.Plugin.YtDlp.dll"
+      DebugInfo="false"
+      XmlDocumentation="false"
+      CopyAttributes="true"
+      Parallel="false"
+      Verbose="false"
+      NoRepackRes="true" />
+    <WriteLinesToFile File="$(IntermediateOutputPath)plugin-merge.stamp" Lines="merged" Overwrite="true" />
+    <Message Importance="high" Text="Merged CliWrap + FluentValidation into $(TargetDir)Lidarr.Plugin.YtDlp.dll" />
+  </Target>
+</Project>

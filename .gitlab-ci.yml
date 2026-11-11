@@ -1,9 +1,15 @@
-# CI for Lidarr.Plugin.YtDlp — build + tests on push
+# CI for Lidarr.Plugin.YtDlp — build (Release, ILRepack-merged + zip) → test → package verify.
+#
+# Note: the plugin project references the Lidarr.Plugin.Common submodule
+# (ext/Lidarr.Plugin.Common) for Lidarr.Plugin.Abstractions, so submodules must
+# be checked out. GIT_SUBMODULE_STRATEGY: recursive handles this for every job.
 stages:
   - build
   - test
+  - package
 
 variables:
+  GIT_SUBMODULE_STRATEGY: recursive
   DOTNET_CLI_TELEMETRY_OPTOUT: "1"
   DOTNET_NOLOGO: "1"
   NUGET_PACKAGES: "$CI_PROJECT_DIR/.nuget/packages"
@@ -11,20 +17,30 @@ variables:
 default:
   image: mcr.microsoft.com/dotnet/sdk:8.0
 
+# Release build. The plugin project's Release-only targets run during this build:
+#   1. MergePluginDependencies — ILRepack merges CliWrap + FluentValidation into
+#      Lidarr.Plugin.YtDlp.dll (host-shared Abstractions/Logging stay external).
+#   2. ZipRelease — stages exactly {Lidarr.Plugin.YtDlp.dll, plugin.json} into
+#      artifacts/net8.0.zip (the shippable artifact).
 build:
   stage: build
   script:
-    - dotnet restore Lidarr.Plugin.YtDlp.sln
-    - dotnet build Lidarr.Plugin.YtDlp.sln --configuration Release --no-restore -v minimal
+    - dotnet build Lidarr.Plugin.YtDlp.sln --configuration Release -v minimal
+    - ls -la artifacts/
   artifacts:
     paths:
+      # Plugin Release output (the packaging tests inspect it by relative path)
       - Lidarr.Plugin.YtDlp/bin/Release/net8.0/
+      # Test project output (lets the test job run --no-build)
+      - Lidarr.Plugin.YtDlp.Tests/bin/Release/net8.0/
+      # Shippable artifact
+      - artifacts/net8.0.zip
     expire_in: 1 week
 
 test:
   stage: test
   script:
-    - dotnet test Lidarr.Plugin.YtDlp.sln --configuration Release --no-build --logger "trx;LogFileName=test-results.trx"
+    - dotnet test Lidarr.Plugin.YtDlp.Tests/Lidarr.Plugin.YtDlp.Tests.csproj --configuration Release --no-build --logger "trx;LogFileName=test-results.trx"
   artifacts:
     when: always
     paths:
@@ -33,3 +49,21 @@ test:
       dotnet:
         - "**/*test-results*.trx"
     expire_in: 1 week
+
+# Independent verification of the shippable artifact: re-runs the packaging test
+# suite against artifacts/net8.0.zip (zip contents, merged-DLL references, manifest
+# consistency). Needs the build job's artifact + the test project output.
+package:
+  stage: package
+  script:
+    - dotnet test Lidarr.Plugin.YtDlp.Tests/Lidarr.Plugin.YtDlp.Tests.csproj --configuration Release --no-build --filter "FullyQualifiedName~Packaging" -v minimal
+    - ls -la artifacts/net8.0.zip
+  needs:
+    - job: build
+      artifacts: true
+    - job: test
+      artifacts: false
+  artifacts:
+    paths:
+      - artifacts/net8.0.zip
+    expire_in: 1 month

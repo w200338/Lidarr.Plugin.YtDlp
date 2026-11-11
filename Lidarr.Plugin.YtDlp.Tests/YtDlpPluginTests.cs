@@ -2,6 +2,7 @@ using Lidarr.Plugin.Abstractions.Capabilities;
 using Lidarr.Plugin.Abstractions.Contracts;
 using Lidarr.Plugin.YtDlp;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using NSubstitute;
 using NUnit.Framework;
 
@@ -46,7 +47,9 @@ public class YtDlpPluginTests
     {
         var plugin = new YtDlpPlugin();
 
-        Assert.That(plugin.SettingsProvider, Is.SameAs(plugin.SettingsProvider));
+        var first = plugin.SettingsProvider;
+        var second = plugin.SettingsProvider;
+        Assert.That(second, Is.SameAs(first));
         Assert.That(plugin.SettingsProvider.Describe().Count, Is.EqualTo(8));
     }
 
@@ -54,7 +57,7 @@ public class YtDlpPluginTests
     public async Task InitializeAsync_stores_context_and_exposes_logger()
     {
         var context = Substitute.For<IPluginContext>();
-        context.LoggerFactory.Returns(LoggerFactory.Create(_ => { }));
+        context.LoggerFactory.Returns(NullLoggerFactory.Instance);
 
         var plugin = new YtDlpPlugin();
         var loggerBefore = plugin.Logger;
@@ -77,7 +80,7 @@ public class YtDlpPluginTests
     {
         var plugin = new YtDlpPlugin();
         var context = Substitute.For<IPluginContext>();
-        context.LoggerFactory.Returns(LoggerFactory.Create(_ => { }));
+        context.LoggerFactory.Returns(NullLoggerFactory.Instance);
         await plugin.InitializeAsync(context);
 
         Assert.That(await plugin.CreateIndexerAsync(), Is.Null);
@@ -88,7 +91,7 @@ public class YtDlpPluginTests
     public async Task DisposeAsync_clears_context()
     {
         var context = Substitute.For<IPluginContext>();
-        context.LoggerFactory.Returns(LoggerFactory.Create(_ => { }));
+        context.LoggerFactory.Returns(NullLoggerFactory.Instance);
         var plugin = new YtDlpPlugin();
         await plugin.InitializeAsync(context);
         await plugin.DisposeAsync();

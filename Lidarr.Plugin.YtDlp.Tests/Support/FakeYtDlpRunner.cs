@@ -29,8 +29,8 @@ public sealed class FakeYtDlpRunner : IYtDlpRunner
         { get; set; }
         = (args, ct) => Task.FromResult(new YtDlpRunResult(0, string.Empty, string.Empty));
 
-    /// <summary>Stdout lines to emit for the next streaming call (consumed in order).</summary>
-    public Queue<(string StdOut, string StdErr)> StreamLines { get; } = new();
+    /// <summary>Lines to emit for the next streaming call (consumed in order); a null half means "no line on that stream".</summary>
+    public Queue<(string? StdOut, string? StdErr)> StreamLines { get; } = new();
 
     /// <summary>Exit code for the next streaming call (default 0).</summary>
     public int StreamExitCode { get; set; }
