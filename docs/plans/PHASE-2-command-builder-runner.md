@@ -1,6 +1,6 @@
 # PHASE 2: yt-dlp command builder + process runner
 
-STATUS: PENDING
+STATUS: COMPLETED (2026-11-11)
 
 ## Goal
 Pure, fully unit-tested logic that turns (settings, intent) into exact yt-dlp argument

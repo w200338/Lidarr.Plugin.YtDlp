@@ -247,3 +247,27 @@ catch (OperationCanceledException) { /* cancelled: already interrupted/killed */
 - Official Readme at tag 3.10.1 (usage, encoding, cancellation patterns, `CommandTask` process
   info); pipe operators (`Command | PipeTarget|Stream|StringBuilder|delegate`, stdout+stderr tuple
   variants, `PipeSource|...|Command | Command`) in `CliWrap/Command.PipeOperators.cs` — identical in both tags.
+
+## Verified against CliWrap 3.10.1 (source: `Tyrrrz/CliWrap` `prime` branch)
+
+Checked while implementing Phase 2 — these are the load-bearing facts:
+
+- Namespace is **`CliWrap`** (not `Tyrrrz.Cli` — that was the pre-3.0 name).
+- `Command.ExecuteBufferedAsync(Encoding, CancellationToken)` is a convenience
+  over `(outEnc, errEnc, forcefulCt, gracefulCt)`; single token = forceful only.
+- **Forceful** cancellation = SIGKILL to the **entire process tree** (children,
+  e.g. ffmpeg, included). **Graceful** = SIGINT (yt-dlp handles it: stops, cleans
+  up partial files). `TryKill` defaults to `entireProcessTree: true`.
+- `Command.ListenAsync(enc, enc, forcefulCt, gracefulCt)` **tees** output: it
+  merges a channel onto `command.StandardOutputPipe`/`StandardErrorPipe`
+  (`PipeTarget.Merge(existing, ToDelegate(transmitter))`), so events and any
+  attached pipe targets coexist.
+- Event types: `CommandEvent` base → `StandardOutputCommandEvent`/
+  `StandardErrorCommandEvent` (each carries a **line**: the internal transmitter
+  delegate is built with `ToDelegate`, which reads via `StreamReader.ReadLinesAsync`)
+  and a final `ExitedCommandEvent` (`.ExitCode`).
+- `PipeTarget.ToDelegate(Func<string, CancellationToken, Task>, Encoding)` is
+  line-oriented (ReadLinesAsync), not chunk-oriented.
+- `CommandResultValidation.None` is required to keep non-zero exits out of the
+  exception path.
+- Encoding defaults to the console encoding — always pass `Encoding.UTF8`.
