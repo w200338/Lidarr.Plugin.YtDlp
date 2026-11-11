@@ -7,11 +7,24 @@
     <Nullable>enable</Nullable>
     <RootNamespace>Lidarr.Plugin.YtDlp</RootNamespace>
     <AssemblyName>Lidarr.Plugin.YtDlp</AssemblyName>
-    <Description>Lidarr plugin: YouTube downloader/indexer backed by an existing yt-dlp installation, with SponsorBlock filtering.</Description>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="CliWrap" Version="3.7.1" />
+    <!-- Versions must stay >= what the Lidarr.Plugin.Common/Abstractions submodule
+         references (CliWrap 3.10.1, M.E.Logging.Abstractions 8.0.3) to avoid NU1605. -->
+    <PackageReference Include="CliWrap" Version="3.10.1" />
+    <PackageReference Include="FluentValidation" Version="9.5.4" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="8.0.3" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\ext\Lidarr.Plugin.Common\src\Abstractions\Lidarr.Plugin.Abstractions.csproj" />
+    <ProjectReference Include="..\ext\Lidarr.Plugin.Common\src\Lidarr.Plugin.Common.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="..\plugin.json" Link="plugin.json" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>

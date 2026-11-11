@@ -1,6 +1,6 @@
 # PHASE 1: Project wiring + plugin skeleton + settings
 
-STATUS: PENDING
+STATUS: COMPLETED (2026-11-11)
 
 ## Goal
 Make the plugin project build against the real Lidarr plugin contracts and expose the

@@ -1,6 +1,6 @@
 # RESEARCH PLAN — Lidarr.Plugin.YtDlp
 
-STATUS: IN PROGRESS
+STATUS: COMPLETE (all topics done 2026-11-11)
 
 Research topics to be covered, one by one. Each topic produces a summary doc in `docs/research/`.
 Internal knowledge may be outdated — everything must be verified against live sources (web / GitHub / NuGet).
