@@ -1,6 +1,6 @@
 # PHASE 3: Download client + single-flight queue with spacing
 
-STATUS: PENDING
+STATUS: COMPLETED (2026-11-11)
 
 ## Goal
 `IDownloadClient` implementation: enqueue album downloads, run EXACTLY ONE yt-dlp
@@ -66,3 +66,60 @@ Indexer (P4), SB HTTP probe / full connection test (P5), packaging (P6).
 
 ## Definition of done
 `dotnet build` green, `dotnet test` all green, plan status COMPLETED, committed.
+
+## Implementation notes (2026-11-11)
+Deviations from the plan and things worth knowing when reading the code:
+
+- **Token format**: `yt:<videoId>` and `playlist:<id>`, validated charset
+  `[A-Za-z0-9_-]`, max 64 chars. `playlist:<id>#N` suffix is accepted and
+  stripped (normalizes to the same album). `YtDlpAlbumId.TryParse/ToUrl/
+  TryFromUrl` — inverse round-trips are unit-tested.
+- **Scheduler** (`Queue/DownloadScheduler.cs`): unbounded
+  `Channel<ScheduledJob>` (SingleReader) + one pump task, started lazily from
+  `Enqueue`/`Start()`. First job runs immediately; subsequent jobs pause a
+  random `[minDelay, maxDelay]` measured from the previous job's FINISH time;
+  if idle time already exceeded maxDelay the pause is skipped (spacing budget
+  already spent). Injectable `randomSeconds`, `delayFor`, `now` seams — tests
+  run with virtual clocks.
+- **Scheduler stop semantics (bug found by tests)**: `Channel.Writer
+  .CompleteAsync()` does NOT discard queued items, and
+  `ReadAllAsync(cancelledToken)` keeps returning items that are already in the
+  queue — so `StopAsync` sets a `_stopping` flag, the pump checks it before
+  starting each job and CANCELS the CTS of every job it skips (their owners
+  mark the item Cancelled). The in-flight job's CTS is tracked as `_activeCts`
+  and canceled when `cancelPending: true`. Without the flag, `StopAsync(true)`
+  silently ran the whole queue.
+- **Downloader** (`Download/YtDlpAlbumDownloader.cs`): buffered `--simulate -J`
+  probe (best-effort metadata → `item.Album` + total track count; failures
+  non-fatal) then the real streaming download. Progress: stderr parser with a
+  500 ms throttle into the item + one un-throttled final sync before terminal
+  state. Non-zero exit → Failed with a 15-line/2000-char stderr tail.
+- **Cancellation mapping**: the runner contract says OCE is the ONLY
+  exception path (cancellation, incl. the 10 s SIGINT→SIGKILL escalation), so
+  the downloader catches ANY `OperationCanceledException` and maps to
+  Cancelled — a `when (ct.IsCancellationRequested)` filter was too strict (an
+  internal runner timeout surfaces as OCE with a different token).
+- **Client** (`Download/YtDlpDownloadClient.cs`): implements `IDownloadClient`
+  directly (no `BaseStreamingDownloadClient` — that base is HTTP-shaped).
+  `ConcurrentDictionary<string, Job>`; duplicate enqueue of the same
+  normalized album id + output path while non-terminal returns the EXISTING id
+  (no double downloads; documented in the plan's test list). Terminal items
+  stay visible for a 5-minute grace period, pruned lazily on
+  `GetActiveDownloadsAsync`. `RemoveDownloadAsync` cancels the job CTS and
+  best-effort deletes the output directory when `deleteData`.
+- **Factory** (`YtDlpPlugin.CreateDownloadClientAsync`): `IPluginContext`
+  carries no settings, so the factory reads the validated snapshot from the
+  stable `YtDlpSettingsProvider` (the host applies settings to it) and returns
+  `null` when `ytDlpPath` is blank.
+- **Test-fake pitfall (caused a test-host hang)**: `FakeYtDlpRunner` now
+  (a) returns a thread-safe snapshot from `Calls`, (b) treats `StreamException`
+  as one-shot, and (c) honors the job token while blocked on `StreamBlock`
+  (cancellation completes the block with OCE). A fake that ignored the token
+  made `DisposeAsync → StopAsync → await pump` wait forever after a test threw
+  before releasing the block.
+- **C# closure pitfall (caught by tests)**: scheduler tests that built
+  `ScheduledJob.Run` lambdas over a `for` loop variable captured the loop var
+  (always final value) and never signaled completion — classic
+  `var index = i;` fix.
+
+Test count for the phase: 48 new (114 total, all green).

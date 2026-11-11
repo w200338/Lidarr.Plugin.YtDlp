@@ -114,6 +114,19 @@ public sealed class YtDlpCommandBuilder
         url
     ];
 
+    /// <summary>Fast metadata probe for a playlist (flat = entries not resolved, so it stays quick).</summary>
+    public IReadOnlyList<string> BuildPlaylistProbeArgs(string url) =>
+    [
+        "--ignore-config",
+        "--no-warnings",
+        "--no-color",
+        "--flat-playlist",
+        "--simulate",
+        "-J",
+        "--",
+        url
+    ];
+
     private static List<string> CommonArgs() =>
     [
         "--ignore-config",

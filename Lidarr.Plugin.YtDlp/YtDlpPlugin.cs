@@ -1,6 +1,8 @@
 using System.Text.Json;
 using Lidarr.Plugin.Abstractions.Contracts;
 using Lidarr.Plugin.Abstractions.Manifest;
+using Lidarr.Plugin.YtDlp.Download;
+using Lidarr.Plugin.YtDlp.Runner;
 using Lidarr.Plugin.YtDlp.Settings;
 using Microsoft.Extensions.Logging;
 
@@ -8,9 +10,8 @@ namespace Lidarr.Plugin.YtDlp;
 
 /// <summary>
 /// Plugin entry point discovered by the Lidarr host via <c>plugin.json</c>
-/// (main = this assembly). Indexer and download client construction happens in
-/// Phases 4/3 respectively; until then the factories return null, which the host
-/// treats as "capability not available" for this plugin version.
+/// (main = this assembly). The download client is live (Phase 3); the indexer
+/// arrives in Phase 4 (factory returns null = capability unavailable).
 /// </summary>
 public sealed class YtDlpPlugin : IPlugin
 {
@@ -62,8 +63,21 @@ public sealed class YtDlpPlugin : IPlugin
 
     public ValueTask<IDownloadClient?> CreateDownloadClientAsync(CancellationToken cancellationToken = default)
     {
-        // Phase 3: return the yt-dlp download client (single-flight queue).
-        return ValueTask.FromResult<IDownloadClient?>(null);
+        lock (_stateLock)
+        {
+            // Settings flow: the host calls Apply on our stable SettingsProvider
+            // instance (see ISettingsProvider); the factory then reads the
+            // validated snapshot from it. IPluginContext carries no settings.
+            if (SettingsProvider is not YtDlpSettingsProvider provider
+                || provider.Current is not { } settings
+                || string.IsNullOrWhiteSpace(settings.YtDlpPath))
+            {
+                return ValueTask.FromResult<IDownloadClient?>(null);
+            }
+
+            var runner = new CliWrapYtDlpRunner(settings.YtDlpPath);
+            return ValueTask.FromResult<IDownloadClient?>(new YtDlpDownloadClient(settings, runner));
+        }
     }
 
     /// <summary>Logger from the host context (null before InitializeAsync).</summary>
