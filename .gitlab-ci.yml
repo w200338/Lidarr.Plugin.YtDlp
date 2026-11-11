@@ -40,14 +40,14 @@ build:
 test:
   stage: test
   script:
-    - dotnet test Lidarr.Plugin.YtDlp.Tests/Lidarr.Plugin.YtDlp.Tests.csproj --configuration Release --no-build --logger "trx;LogFileName=test-results.trx"
+    - dotnet test Lidarr.Plugin.YtDlp.Tests/Lidarr.Plugin.YtDlp.Tests.csproj --configuration Release --no-build --logger "junit;LogFileName=test-results.xml"
   artifacts:
     when: always
     paths:
-      - "**/*test-results*.trx"
+      - test-results.xml
     reports:
-      dotnet:
-        - "**/*test-results*.trx"
+      junit:
+        - test-results.xml
     expire_in: 1 week
 
 # Independent verification of the shippable artifact: re-runs the packaging test
