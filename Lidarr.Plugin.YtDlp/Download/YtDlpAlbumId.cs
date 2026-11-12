@@ -5,7 +5,9 @@ public enum YtDlpAlbumKind
     /// <summary>Single YouTube video treated as a one-track album.</summary>
     SingleTrack,
     /// <summary>YouTube playlist treated as an album.</summary>
-    Playlist
+    Playlist,
+    /// <summary>YouTube Music album browse page (music.youtube.com/browse/...).</summary>
+    Browse
 }
 
 /// <summary>
@@ -13,21 +15,32 @@ public enum YtDlpAlbumKind
 /// (Phase 4) and the download client (this phase):
 ///   <c>yt:&lt;videoId&gt;</c>    → single-track album
 ///   <c>playlist:&lt;id&gt;</c>   → playlist album
+///   <c>browse:&lt;id&gt;</c>     → YouTube Music album browse page (fallback when
+///                              the entry inspection could not resolve the
+///                              canonical playlist id; yt-dlp handles the
+///                              browse URL directly)
 /// </summary>
 public readonly record struct YtDlpAlbumRef(YtDlpAlbumKind Kind, string Id)
 {
-    public override string ToString() =>
-        Kind == YtDlpAlbumKind.SingleTrack ? $"yt:{Id}" : $"playlist:{Id}";
+    public override string ToString() => Kind switch
+    {
+        YtDlpAlbumKind.SingleTrack => $"yt:{Id}",
+        YtDlpAlbumKind.Playlist => $"playlist:{Id}",
+        YtDlpAlbumKind.Browse => $"browse:{Id}",
+        _ => throw new ArgumentOutOfRangeException(nameof(Kind))
+    };
 }
 
 public static class YtDlpAlbumId
 {
     private const string SingleTrackPrefix = "yt:";
     private const string PlaylistPrefix = "playlist:";
+    private const string BrowsePrefix = "browse:";
     private const char PlaylistSeparator = '#';
 
     public static readonly string SingleTrackUrlBase = "https://www.youtube.com/watch?v=";
     public static readonly string PlaylistUrlBase = "https://www.youtube.com/playlist?list=";
+    public static readonly string BrowseUrlBase = "https://music.youtube.com/browse/";
 
     /// <summary>
     /// Parses a token. Accepts an optional '#0' track index suffix (e.g.
@@ -83,6 +96,18 @@ public static class YtDlpAlbumId
             return false;
         }
 
+        if (token.StartsWith(BrowsePrefix, StringComparison.Ordinal))
+        {
+            idPart = token[BrowsePrefix.Length..];
+            if (TryValidateId(idPart, out var browseId))
+            {
+                result = new YtDlpAlbumRef(YtDlpAlbumKind.Browse, browseId);
+                return true;
+            }
+
+            return false;
+        }
+
         return false;
     }
 
@@ -91,6 +116,7 @@ public static class YtDlpAlbumId
         {
             YtDlpAlbumKind.SingleTrack => SingleTrackUrlBase + album.Id,
             YtDlpAlbumKind.Playlist => PlaylistUrlBase + album.Id,
+            YtDlpAlbumKind.Browse => BrowseUrlBase + album.Id,
             _ => throw new ArgumentOutOfRangeException(nameof(album))
         };
 
@@ -146,6 +172,28 @@ public static class YtDlpAlbumId
             if (TryValidateId(id, out var playlistUrlId))
             {
                 result = new YtDlpAlbumRef(YtDlpAlbumKind.Playlist, playlistUrlId);
+                return true;
+            }
+
+            return false;
+        }
+
+        // YouTube Music album browse pages ("https://music.youtube.com/browse/MPREb_...").
+        // yt-dlp downloads the album playlist behind such a page directly, so the
+        // browse URL is a valid download target even when the entry inspection
+        // could not resolve the canonical playlist id.
+        if (url.StartsWith(BrowseUrlBase, StringComparison.OrdinalIgnoreCase))
+        {
+            var id = url[BrowseUrlBase.Length..];
+            var q = id.IndexOf('?');
+            if (q >= 0)
+            {
+                id = id[..q];
+            }
+
+            if (TryValidateId(id, out var browseUrlId))
+            {
+                result = new YtDlpAlbumRef(YtDlpAlbumKind.Browse, browseUrlId);
                 return true;
             }
 

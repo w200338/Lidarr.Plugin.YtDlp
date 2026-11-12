@@ -57,6 +57,20 @@ public class YtDlpCommandBuilderTests
     }
 
     [Test]
+    public void BuildEntryInspectArgs_flat_inspection_of_one_entry()
+    {
+        var url = "https://music.youtube.com/browse/MPREb_xeu6Cioqsdc";
+        var args = _builder.BuildEntryInspectArgs(url);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(args, Does.Contain("--flat-playlist"), "flat: one page fetch, no per-track extraction");
+            Assert.That(args[Idx(args, "--print") + 1], Is.EqualTo(YtDlpCommandBuilder.InspectPrintTemplate));
+            Assert.That(args[^1], Is.EqualTo(url));
+        });
+    }
+
+    [Test]
     public void BuildSingleDownloadArgs_disabled_reencode_keeps_source_audio()
     {
         var args = _builder.BuildSingleDownloadArgs(
@@ -72,8 +86,11 @@ public class YtDlpCommandBuilderTests
             Assert.That(args, Does.Contain("--newline"));
             Assert.That(args, Does.Contain("-f"));
             Assert.That(args[Idx(args, "-f") + 1], Is.EqualTo("ba/b"));
-            Assert.That(args, Does.Not.Contain("-x"), "no extraction when re-encode disabled");
-            Assert.That(args, Does.Not.Contain("--audio-format"));
+            // Audio extraction without re-encoding: -x keeps the source codec
+            // and writes a codec-appropriate, host-accepted container
+            // (YouTube's best audio is Opus → .opus, not .webm).
+            Assert.That(args, Does.Contain("-x"));
+            Assert.That(args, Does.Not.Contain("--audio-format"), "no re-encode when disabled");
             Assert.That(args, Does.Contain("--embed-metadata"));
             Assert.That(args, Does.Contain("--no-playlist"));
             Assert.That(args, Does.Not.Contain("--sponsorblock-remove"));

@@ -88,9 +88,9 @@ New namespace `Lidarr.Plugin.YtDlp.Native` (or root):
           - playlist hits → single "album" release pointing at the playlist.
       - `FetchRecent()` → empty list.
       - `GetDownloadRequest(link)` → `new HttpRequest(link, HttpMethod.GET)`.
-      - `Test()` → run `YtDlpConnectionTester` (yt-dlp version probe; ffmpeg probe
-        when re-encode/SponsorBlock enabled; SponsorBlock reachability) →
-        `ValidationResult`.
+      - `Test()` → run `YtDlpConnectionTester` (yt-dlp version probe; ffmpeg
+        probe — always required since audio extraction runs through ffmpeg;
+        SponsorBlock reachability when enabled) → `ValidationResult`.
       - `RequestAction` → null.
 - [ ] `YtDlpClientSettings : IProviderConfig` + `YtDlpIndexerSettings : IProviderConfig`
       - same 8 fields as today, each with `[FieldDefinition]` (see research doc
@@ -119,8 +119,7 @@ New namespace `Lidarr.Plugin.YtDlp.Native` (or root):
       - `GetStatus()` → `IsLocalhost = false`, `OutputRootFolders = [download root]`.
       - `GetImportItem(item, previous)` → return item.
       - `MarkItemAsImported(item)` → remove completed job from queue (or no-op).
-      - `Test(failures)` → same probes as the indexer `Test()` (ffmpeg only when
-        re-encode/SponsorBlock enabled).
+      - `Test(failures)` → same probes as the indexer `Test()` (ffmpeg always).
 - [ ] Delete the old Abstractions-model adapter files
       (`YtDlpPlugin.cs`, old `YtDlpIndexer.cs`, old `YtDlpDownloadClient.cs`,
       `YtDlpSettingsProvider.cs`, `ISettingsProvider` glue) once the native layer
@@ -359,8 +358,10 @@ reference-version guards).
    and cannot reach `gitlab.gitgudaim.com`).
 2. Configure the GitLab push-mirror to `https://github.com/w200338/lidarr.plugin.ytdlp`
    (mirror commits **and tags**) and confirm that GitHub repository name.
-3. Tag (e.g. `v0.2.1`) → GitLab release job publishes the zip; mirror tag →
-   GitHub release for the UI install path.
+3. Tag `v0.2.2` → GitLab release job publishes the zip; mirror tag →
+   GitHub release for the UI install path (`v0.2.1` is already out and only
+   contains the load-compatibility fix; `v0.2.2` adds everything listed in
+   the post-0.2.1 fixes section above).
 4. Live validation on the user's host: manual install to
    `/var/lib/lidarr/plugins/w200338/lidarr-plugin-ytdlp/`, restart,
    System → Plugins shows `YtDlp`; add download client + indexer,
@@ -368,3 +369,77 @@ reference-version guards).
    search → grab → download → import. If matching/grab fails, the
    `ReleaseInfo.Title` composition in `YtDlpIndexer.MapRelease` is the
    first thing to adjust (research §8.1).
+
+## Post-0.2.1 fixes (v0.2.2)
+
+Found via live E2E against a pristine official `v3.1.6.5079` host
+(search → grab → queue → download → import):
+
+### 1. Installed version displayed as `1.0.0.0`
+The CI build override `-p:AssemblyVersion=1.0.0.0` (added to fix
+host-contract binding) also squashed the plugin's own `AssemblyVersion`.
+The host reads `AssemblyInformationalVersionAttribute` first; the SDK had
+appended `+<git hash>` to it, which `PluginVersion.Parse`
+(`Version.TryParse` on the part before `-`) rejects, so the host fell back
+to the squashed `AssemblyVersion` → `1.0.0.0` (which also made the UI hide
+updates, since `1.0.0.0 > 0.2.1.0`).
+**Fix:** project now sets `<Version>0.2.2</Version>`,
+`<InformationalVersion>0.2.2</InformationalVersion>`,
+`<IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>`;
+the CI `AssemblyVersion` override was removed — host-contract references are
+stamped by the `RewriteHostReferenceVersions` target after the merge instead.
+
+### 2. Plugin state invisible across host provider instances (empty queue)
+`Download()` was called on one provider instance (host resolves providers by
+concrete type via DI; container registrations are per-interface singletons,
+so concrete-type resolution can return a different instance than the
+interface one), while `GetItems()` polled another → jobs stored in instance
+fields were never seen → queue stayed empty and no download ever started.
+**Fix:** `SharedClientStates` — a process-wide job store keyed by saved
+provider definition id (id 0 = unsaved/test definition → per-instance
+fallback so unit tests stay isolated). Regression test: a second client
+instance with the same definition id sees jobs enqueued by the first.
+
+### 3. Album search returned unparseable releases
+Flat album-search entries carry no title (only `id`/`url`), and
+`PublishDate = DateTime.MinValue` rendered as `739931 days`.
+**Fix:** each entry is flat-re-fetched once
+(`--print '%(.{playlist_title,playlist_channel,playlist_id})j'`) to resolve
+the real album title (stripping the page's `Album - ` prefix) and the
+canonical `playlist_id`. `ReleaseInfo.Title` = `Artist - <real album>`
+(falling back to the criteria album title, then the whole query),
+`PublishDate = DateTime.UtcNow`. When a `playlist_id` resolves,
+`DownloadUrl` becomes `https://www.youtube.com/playlist?list=...`; otherwise
+the `https://music.youtube.com/browse/...` URL is kept (the download client
+now accepts `browse:` tokens / browse URLs, yt-dlp downloads them directly).
+
+### 4. Import found 0 tracks: `.webm` is not a host-accepted audio extension
+The host's `DiskScanService` filters files by `MediaFileExtensions.Extensions`
+(mp2/mp3/m4a/m4b/m4p/ogg/oga/opus/wma/wav/wv/flac/ape/aif/aiff/aifc) —
+no `.webm`. yt-dlp's `bestaudio` without `-x` leaves the source container
+(webm/opus), so every downloaded file was invisible to import.
+**Fix:** the no-re-encode path now uses `-f ba/b -x --embed-metadata`:
+`ba` prefers the best audio-only stream, `-x` (without `--audio-format`)
+extracts the source codec losslessly into a matching, host-accepted
+container (opus → `.opus`), and `-x` also guarantees no video is ever
+downloaded even if the `/b` fallback hits a combined stream on a
+non-YouTube URL. Side effect: **ffmpeg is now always required** (audio
+extraction + metadata embedding), so the connection test checks
+`ffmpeg -version` unconditionally.
+
+### 5. Rewriter whole-file UTF-8 pass corrupted the DLL
+The defense-in-depth attribute-blob version patch decoded/re-encoded the
+entire PE as UTF-8 text, corrupting binary sections.
+**Fix:** byte-level in-place patching — scan ASCII
+`Lidarr.{Core,Common,Http}, Version=` prefixes in the raw bytes and replace
+higher versions with a same-length zero form (e.g. `10.0.0.21720` →
+`0.0.0.000000`), preserving every metadata blob length prefix; no-op when
+embedded versions are already ≤ target. Packaging tests guard both the
+AssemblyRef table and any embedded host version strings in the merged DLL.
+
+### Verified E2E on the official host (v3.1.6.5079)
+Search (real album titles, canonical playlist URLs, no absurd age) →
+grab (HTTP 200) → queue (`downloading` → `completed`) → download
+(11 × `.opus`, audio only) → import (11 tracks moved to
+`{root}/Adele/`) → album statistics show the files. 220/220 tests green
+in Debug and Release.

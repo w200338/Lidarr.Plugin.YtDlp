@@ -34,6 +34,11 @@ public class YtDlpDownloadClientTests
     private IDiskProvider _diskProvider = null!;
     private Func<string, IYtDlpRunner>? _previousFactory;
 
+    // Unique per test: job state is shared process-wide per definition id
+    // (see SharedClientState), so tests must not collide on an id.
+    private static int _nextDefinitionId;
+    private int _definitionId;
+
     [SetUp]
     public void SetUp()
     {
@@ -70,9 +75,10 @@ public class YtDlpDownloadClientTests
             Substitute.For<ILocalizationService>(),
             LogManager.GetLogger("test"));
 
+        _definitionId = Interlocked.Increment(ref _nextDefinitionId);
         _client.Definition = new DownloadClientDefinition
         {
-            Id = 3,
+            Id = _definitionId,
             Name = "TestClient",
             Settings = settings
         };
@@ -81,6 +87,23 @@ public class YtDlpDownloadClientTests
     [TearDown]
     public void TearDown()
     {
+        // Cancel any in-flight jobs left behind (e.g. the duplicate-enqueue
+        // test's blocker) so nothing keeps running under the shared state.
+        var shared = SharedClientStates.For(_definitionId);
+        foreach (var job in shared?.Jobs.Values ?? Array.Empty<DownloadJobState>())
+        {
+            if (!job.IsCompleted)
+            {
+                try
+                {
+                    job.Cts.Cancel();
+                }
+                catch (ObjectDisposedException)
+                {
+                }
+            }
+        }
+
         YtDlpRunners.Factory = _previousFactory!;
         YtDlpRunners.ClearCache();
         YtDlpConnectionTest.Override = null;
@@ -164,6 +187,31 @@ public class YtDlpDownloadClientTests
     }
 
     [Test]
+    public async Task Download_accepts_music_browse_album_urls()
+    {
+        // The indexer's album search emits music browse URLs when the entry
+        // inspection could not resolve the canonical playlist id. The client
+        // must accept them (yt-dlp downloads the album behind the page) and
+        // actually run the download.
+        _fake.StreamLines.Enqueue((null, "[download] Destination: /tmp/Track.m4a"));
+        _fake.StreamLines.Enqueue((null, "[download] 100.0% of 10.00KiB at 10.00KiB/s"));
+
+        var album = RemoteAlbum();
+        album.Release = new ReleaseInfo
+        {
+            Title = "Artist A - Great Album",
+            Artist = "Artist A",
+            Album = "Great Album",
+            DownloadUrl = "https://music.youtube.com/browse/MPREb_IRSjexVmMMl"
+        };
+
+        var id = await _client.Download(album, Substitute.For<IIndexer>());
+
+        var item = await WaitFor(_client, id, DownloadItemStatus.Completed);
+        Assert.That(item.Status, Is.EqualTo(DownloadItemStatus.Completed));
+    }
+
+    [Test]
     public async Task Duplicate_download_while_active_returns_same_id()
     {
         // Hold the job in-flight so the second enqueue sees it as not-terminal.
@@ -197,6 +245,38 @@ public class YtDlpDownloadClientTests
         var item = await WaitFor(_client, id, DownloadItemStatus.Failed);
         Assert.That(item.Message, Does.Contain("exited with code 1"));
         Assert.That(item.Message, Does.Contain("Signature extraction failed"));
+    }
+
+    // ----- host instance-transient behavior (SharedClientState) -----
+
+    [Test]
+    public async Task GetItems_sees_jobs_enqueued_by_another_instance_same_definition()
+    {
+        // Regression: the host resolves provider instances by concrete type
+        // and DI registers plugin concretes as TRANSIENT, so the instance
+        // that receives Download() is not the one polled by GetItems().
+        // Job state must be shared per definition id.
+        var other = new YtDlpDownloadClient(
+            Substitute.For<IConfigService>(),
+            _diskProvider,
+            Substitute.For<IRemotePathMappingService>(),
+            Substitute.For<ILocalizationService>(),
+            LogManager.GetLogger("test"));
+        other.Definition = new DownloadClientDefinition
+        {
+            Id = _definitionId, // same saved client as _client
+            Name = "TestClient",
+            Settings = (YtDlpClientSettings)_client.Definition.Settings
+        };
+
+        var id = await _client.Download(RemoteAlbum(), Substitute.For<IIndexer>());
+
+        // The FRESH instance (what a host poll would use) sees the job.
+        var item = other.GetItems().FirstOrDefault(i => i.DownloadId == id);
+        Assert.That(item, Is.Not.Null, "fresh instance with the same definition id must see the enqueued job");
+
+        var completed = await WaitFor(other, id, DownloadItemStatus.Completed);
+        Assert.That(completed.Title, Is.EqualTo("Artist A - Song"));
     }
 
     // ----- RemoveItem / MarkItemAsImported -----

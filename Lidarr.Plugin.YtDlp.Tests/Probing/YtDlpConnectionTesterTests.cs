@@ -82,7 +82,7 @@ public class YtDlpConnectionTesterTests
         };
 
     [Test]
-    public async Task All_good_minimal_settings_passes_without_ffmpeg_or_sb_checks()
+    public async Task All_good_minimal_settings_passes_without_sb_check()
     {
         var (tester, probe, sb) = Build();
 
@@ -93,19 +93,9 @@ public class YtDlpConnectionTesterTests
             Assert.That(result.Success, Is.True);
             Assert.That(result.Warnings, Is.Empty);
             Assert.That(probe.YtDlpCalls, Is.EqualTo(1));
-            Assert.That(probe.FfmpegCalls, Is.EqualTo(0), "no reencode and no SponsorBlock → ffmpeg not needed");
+            Assert.That(probe.FfmpegCalls, Is.EqualTo(1), "ffmpeg is always required: audio extraction + metadata embedding run through it even without re-encoding");
             Assert.That(sb.Calls, Is.EqualTo(0));
         });
-    }
-
-    [Test]
-    public async Task Reencode_enabled_triggers_ffmpeg_check()
-    {
-        var (tester, probe, _) = Build();
-
-        _ = await tester.TestAsync(Settings(reencode: ReencodeFormat.Mp3));
-
-        Assert.That(probe.FfmpegCalls, Is.EqualTo(1));
     }
 
     [Test]

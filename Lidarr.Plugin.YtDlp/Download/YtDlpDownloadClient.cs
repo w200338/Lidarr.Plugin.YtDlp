@@ -45,9 +45,25 @@ public class YtDlpDownloadClient : DownloadClientBase<YtDlpClientSettings>
     /// <summary>Terminal items stay visible this long so the host can read the outcome.</summary>
     private static readonly TimeSpan TerminalGracePeriod = TimeSpan.FromMinutes(5);
 
-    private readonly ConcurrentDictionary<string, DownloadJobState> _jobs = new();
-    private readonly object _enqueueLock = new();
-    private DownloadScheduler? _scheduler;
+    // Job state is shared per client definition id, NOT held on the instance:
+    // the host resolves provider instances by concrete type and registers
+    // concrete plugin types as TRANSIENT, so every host call may hit a fresh
+    // instance. See SharedClientState for the full rationale.
+    private SharedClientState? _testState;
+
+    private SharedClientState State
+    {
+        get
+        {
+            var shared = SharedClientStates.For(Definition?.Id ?? 0);
+            if (shared is not null)
+            {
+                return shared;
+            }
+
+            return _testState ??= new SharedClientState(0);
+        }
+    }
 
     public YtDlpDownloadClient(
         IConfigService configService,
@@ -104,7 +120,8 @@ public class YtDlpDownloadClient : DownloadClientBase<YtDlpClientSettings>
     public override IEnumerable<DownloadClientItem> GetItems()
     {
         var now = DateTime.UtcNow;
-        var items = _jobs.Values
+        var jobs = State.Jobs;
+        var items = jobs.Values
             .Where(j => !j.IsCompleted
                         || (j.CompletedAt.HasValue && now - j.CompletedAt.Value < TerminalGracePeriod))
             .Select(MapItem)
@@ -121,7 +138,7 @@ public class YtDlpDownloadClient : DownloadClientBase<YtDlpClientSettings>
             return;
         }
 
-        if (_jobs.TryRemove(item.DownloadId, out var job))
+        if (State.Jobs.TryRemove(item.DownloadId, out var job))
         {
             try
             {
@@ -158,7 +175,7 @@ public class YtDlpDownloadClient : DownloadClientBase<YtDlpClientSettings>
             return;
         }
 
-        if (_jobs.TryGetValue(item.DownloadId, out var job))
+        if (State.Jobs.TryGetValue(item.DownloadId, out var job))
         {
             job.MarkImported();
         }
@@ -209,12 +226,13 @@ public class YtDlpDownloadClient : DownloadClientBase<YtDlpClientSettings>
     private string Enqueue(YtDlpAlbumRef album, string outputPath, string title)
     {
         var normalizedAlbum = album.ToString();
+        var shared = State;
 
-        lock (_enqueueLock)
+        lock (shared.EnqueueLock)
         {
             // Duplicate enqueue of the same album+path while not terminal →
             // return the existing id (no double downloads).
-            foreach (var job in _jobs.Values)
+            foreach (var job in shared.Jobs.Values)
             {
                 if (job.IsCompleted)
                 {
@@ -235,9 +253,9 @@ public class YtDlpDownloadClient : DownloadClientBase<YtDlpClientSettings>
                 OutputPath = outputPath,
                 Title = title
             };
-            _jobs[state.Id] = state;
+            shared.Jobs[state.Id] = state;
 
-            var scheduler = _scheduler ??= CreateScheduler();
+            var scheduler = shared.GetScheduler(CreateScheduler);
             scheduler.Enqueue(new ScheduledJob
             {
                 Id = state.Id,
@@ -346,13 +364,14 @@ public class YtDlpDownloadClient : DownloadClientBase<YtDlpClientSettings>
 
     private void PruneExpiredTerminalJobs(DateTime now)
     {
-        foreach (var job in _jobs.Values)
+        var jobs = State.Jobs;
+        foreach (var job in jobs.Values)
         {
             if (job.IsCompleted
                 && job.CompletedAt.HasValue
                 && now - job.CompletedAt.Value >= TerminalGracePeriod)
             {
-                _jobs.TryRemove(job.Id, out _);
+                jobs.TryRemove(job.Id, out _);
             }
         }
     }

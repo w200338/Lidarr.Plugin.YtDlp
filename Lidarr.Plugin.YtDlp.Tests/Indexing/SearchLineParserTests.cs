@@ -85,4 +85,67 @@ public class SearchLineParserTests
         Assert.That(SearchLineParser.ParseAll(string.Empty), Is.Empty);
         Assert.That(SearchLineParser.ParseAll(null!), Is.Empty);
     }
+
+    // ----- entry inspection (flat re-fetch of browse URLs) -----
+
+    [Test]
+    public void InspectLine_strips_album_page_prefix()
+    {
+        // The music browse page titles albums "Album - <name>" (observed shape).
+        Assert.That(SearchLineParser.TryParseInspectLine("{\"playlist_title\":\"Album - 21\",\"playlist_channel\":null}", out var resolution), Is.True);
+        Assert.Multiple(() =>
+        {
+            Assert.That(resolution, Is.Not.Null);
+            Assert.That(resolution!.Title, Is.EqualTo("21"));
+            Assert.That(resolution.Channel, Is.Null);
+        });
+    }
+
+    [Test]
+    public void InspectLine_without_prefix_is_used_verbatim()
+    {
+        Assert.That(SearchLineParser.TryParseInspectLine("{\"playlist_title\":\"30 \"}", out var resolution), Is.True);
+        Assert.That(resolution!.Title, Is.EqualTo("30"), "trimmed");
+    }
+
+    [Test]
+    public void InspectLine_carries_channel_when_present()
+    {
+        Assert.That(SearchLineParser.TryParseInspectLine("{\"playlist_title\":\"Mix 1\",\"playlist_channel\":\"Adele\"}", out var resolution), Is.True);
+        Assert.Multiple(() =>
+        {
+            Assert.That(resolution!.Title, Is.EqualTo("Mix 1"));
+            Assert.That(resolution.Channel, Is.EqualTo("Adele"));
+        });
+    }
+
+    [Test]
+    public void InspectLine_carries_playlist_id_when_present()
+    {
+        // Observed live: music album browse pages expose the embedded album
+        // playlist (OLAK...) which the indexer turns into the canonical
+        // playlist download URL.
+        Assert.That(SearchLineParser.TryParseInspectLine("{\"playlist_title\":\"Album - 21\",\"playlist_channel\":null,\"playlist_id\":\"OLAK5uy_kNiuS8m9gEwAoTTt62VFPFwPFMdqDC8Oo\"}", out var resolution), Is.True);
+        Assert.That(resolution!.PlaylistId, Is.EqualTo("OLAK5uy_kNiuS8m9gEwAoTTt62VFPFwPFMdqDC8Oo"));
+    }
+
+    [Test]
+    public void InspectLine_without_playlist_id_yields_null_playlist_id()
+    {
+        Assert.That(SearchLineParser.TryParseInspectLine("{\"playlist_title\":\"Album - 21\"}", out var resolution), Is.True);
+        Assert.That(resolution!.PlaylistId, Is.Null);
+    }
+
+    [TestCase(null!)]
+    [TestCase("")]
+    [TestCase("   ")]
+    [TestCase("WARNING: something yt-dlp grumbled")]
+    [TestCase("{not json}")]
+    [TestCase("{\"title\":\"a plain video line without playlist_title\"}")]
+    [TestCase("{\"playlist_title\":\"   \"}")]
+    public void InspectLine_rejects_non_inspect_lines(string line)
+    {
+        Assert.That(SearchLineParser.TryParseInspectLine(line, out var resolution), Is.False);
+        Assert.That(resolution, Is.Null);
+    }
 }

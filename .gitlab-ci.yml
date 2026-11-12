@@ -43,20 +43,22 @@ default:
 # (against the live vulnerability DB) and analyzers keeps the build hermetic
 # against upstream database updates and SDK minor-version differences.
 #
-# -p:AssemblyVersion=1.0.0.0: the host submodule's Directory.Build.props sets
-# <AssemblyVersion>10.0.0.*</AssemblyVersion> (its CI replaces it with the
-# release version). Building the host references without this override makes
-# the plugin reference Lidarr.Core 10.0.0.x, which an installed host
-# (v3.1.6.5079) refuses to bind to - both in assembly references and in the
-# assembly-qualified names the compiler embeds in custom-attribute blobs
-# ([FieldDefinition] enum arguments). 1.0.0.0 is below every released host
-# version, so the plugin binds against any host it is installed in.
-# (tools/ref-version-rewriter re-stamps assembly references and patches
-# attribute blobs as a fallback for builds that miss this flag.)
+# Host-contract versions: the host submodule's Directory.Build.props sets
+# <AssemblyVersion>10.0.0.*</AssemblyVersion> (official Lidarr CI replaces it
+# with the release version), so a plain build makes the plugin reference
+# Lidarr.Core 10.0.0.x - in assembly references AND in the assembly-qualified
+# names the compiler embeds in custom-attribute blobs ([FieldDefinition] enum
+# arguments) - which an installed host (v3.1.6.5079) refuses to bind to.
+# The Release build fixes both via tools/ref-version-rewriter
+# (RewriteHostReferenceVersions target): references are stamped to 1.0.0.0
+# (below every released host version) and embedded blob versions are patched
+# in place. Do NOT use a global -p:AssemblyVersion override: it would squash
+# the plugin's own version, which the host uses for the "installed version"
+# display and the update check.
 build:
   stage: build
   script:
-    - dotnet build Lidarr.Plugin.YtDlp.sln --configuration Release -v minimal -p:NuGetAudit=false -p:EnableAnalyzers=false -p:AssemblyVersion=1.0.0.0
+    - dotnet build Lidarr.Plugin.YtDlp.sln --configuration Release -v minimal -p:NuGetAudit=false -p:EnableAnalyzers=false
     - ls -la artifacts/
   artifacts:
     paths:

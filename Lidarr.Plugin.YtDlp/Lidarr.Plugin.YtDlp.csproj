@@ -17,12 +17,25 @@
     -->
     <DisableTransitiveProjectReferences>true</DisableTransitiveProjectReferences>
     <!--
-      InformationalVersion is read by the host's Plugin.InstalledVersion
-      (NzbDrone.Core.Plugins.Plugin) for the System -> Plugins UI and the
-      GitHub update check. Keep it a plain "major.minor[.patch]" so
-      PluginVersion.Parse succeeds.
+      Versioning: the host reads the AssemblyInformationalVersionAttribute
+      (NzbDrone.Core.Plugins.Plugin.InstalledVersion) for the System -> Plugins
+      UI and the GitHub update check; PluginVersion.Parse only accepts a plain
+      "major.minor[.patch]" (a "-suffix" splits it, a "+hash" makes
+      Version.TryParse fail). Two pitfalls are handled here:
+       - IncludeSourceRevisionInInformationalVersion=false stops the SDK from
+         appending "+<git hash>" to the InformationalVersion (the suffix breaks
+         PluginVersion.Parse and the host falls back to AssemblyVersion, which
+         is why the UI showed "Installed version: 1.0.0.0");
+       - Version also fixes AssemblyVersion, so the fallback path shows the
+         right version too.
+      Bump Version + InformationalVersion together when cutting a release.
+      NOTE: never build with a global -p:AssemblyVersion override - it would
+      squash the plugin's own version as well (host-contract references are
+      stamped by the RewriteHostReferenceVersions target instead).
     -->
-    <InformationalVersion>0.2.1</InformationalVersion>
+    <Version>0.2.2</Version>
+    <InformationalVersion>0.2.2</InformationalVersion>
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
     <!--
       Copy resolved NuGet reference assemblies into the output folder so the
       Release-only ILRepack step can merge CliWrap in. Host project references

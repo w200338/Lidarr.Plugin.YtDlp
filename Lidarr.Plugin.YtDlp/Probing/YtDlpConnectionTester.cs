@@ -36,11 +36,11 @@ public sealed class YtDlpConnectionTester
 
         if (yt.Ok)
         {
-            if (settings.Reencode != ReencodeFormat.Disabled || settings.UseSponsorBlock)
-            {
-                var ffmpeg = await _probe.CheckFfmpegAsync(ct).ConfigureAwait(false);
-                Append(ffmpeg, "Reencode", errors, warnings);
-            }
+            // ffmpeg is always required: even the no-re-encode path extracts the
+            // audio stream ("-x") and embeds metadata, both of which run through
+            // ffmpeg.
+            var ffmpeg = await _probe.CheckFfmpegAsync(ct).ConfigureAwait(false);
+            Append(ffmpeg, "Ffmpeg", errors, warnings);
 
             if (settings.UseSponsorBlock)
             {

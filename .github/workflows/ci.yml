@@ -29,8 +29,13 @@ jobs:
       # -p:NuGetAudit=false / -p:EnableAnalyzers=false: the ext/Lidarr submodule
       # is pinned external code with TreatWarningsAsErrors=true; disabling the
       # audit and analyzers keeps the build hermetic.
+      #
+      # Host-contract references (Lidarr.Core 10.0.0.* from the locally built
+      # submodule, including versions embedded in attribute blobs) are stamped
+      # to 1.0.0.0 by the Release build's RewriteHostReferenceVersions target
+      # (tools/ref-version-rewriter), so the plugin binds on any host.
       - name: Build (Release, ILRepack merge + zip)
-        run: dotnet build Lidarr.Plugin.YtDlp.sln --configuration Release -v minimal -p:NuGetAudit=false -p:EnableAnalyzers=false -p:AssemblyVersion=1.0.0.0
+        run: dotnet build Lidarr.Plugin.YtDlp.sln --configuration Release -v minimal -p:NuGetAudit=false -p:EnableAnalyzers=false
 
       - name: Test
         run: dotnet test Lidarr.Plugin.YtDlp.Tests/Lidarr.Plugin.YtDlp.Tests.csproj --configuration Release --no-build

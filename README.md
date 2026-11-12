@@ -7,8 +7,11 @@ Lidarr plugin: YouTube **downloader + indexer** backed by an existing
 - **Index/search** — searches YouTube (and music.youtube.com) through
   `yt-dlp --flat-playlist` search output and resolves single tracks and
   playlists into Lidarr releases.
-- **Download** — downloads single videos and whole playlists via yt-dlp,
-  reports real progress, and re-encodes to mp3/aac/opus/vorbis when requested.
+- **Download** — downloads the **audio only** (never video) for single tracks
+  and whole playlists via yt-dlp, reports real progress, and re-encodes to
+  mp3/aac/opus/vorbis when requested. Without re-encoding the source codec is
+  kept (lossless extraction, e.g. YouTube's Opus → `.opus` — the host's media
+  scanner accepts `.opus` but not `.webm`).
 - **SponsorBlock** — when enabled, fetched skip segments (intros, outros,
   off-topic, sponsors, self-promo, previews, interactions) are cut out of the
   downloaded song with ffmpeg.
@@ -23,14 +26,16 @@ plugin types at startup via its DI container. There is no `plugin.json`.
 Requires:
 - Lidarr **3.1.6.5079** (stable) or a compatible native-plugins build, .NET 8.
 - A working `yt-dlp` the Lidarr process can execute.
-- `ffmpeg` on the Lidarr process's PATH (only for re-encoding / SponsorBlock).
+- `ffmpeg` on the Lidarr process's PATH (always: audio extraction and metadata
+  embedding run through ffmpeg even without re-encoding; re-encoding and
+  SponsorBlock additionally need it).
 
 ## Repository layout
 
 - `docs/` — research notes (`docs/research/`) and implementation plans
   (`docs/plans/`, one per phase, each with a STATUS line)
 - `Lidarr.Plugin.YtDlp/` — plugin source (net8.0, C# 12)
-- `Lidarr.Plugin.YtDlp.Tests/` — NUnit 3 + NSubstitute tests (198 tests)
+- `Lidarr.Plugin.YtDlp.Tests/` — NUnit 3 + NSubstitute tests (220 tests)
 - `ext/Lidarr` — git submodule pinned to tag `v3.1.6.5079` (host source;
   compile-time contract only, `Private=false`, never shipped)
 - `tools/zip-packager/` — tiny helper that builds the release zip
@@ -43,15 +48,15 @@ Requires:
 
 ```sh
 git submodule update --init --recursive
-dotnet build Lidarr.Plugin.YtDlp.sln -c Release -p:AssemblyVersion=1.0.0.0
+dotnet build Lidarr.Plugin.YtDlp.sln -c Release
 dotnet test  Lidarr.Plugin.YtDlp.Tests/Lidarr.Plugin.YtDlp.Tests.csproj -c Release --no-build
 ```
 
-The `AssemblyVersion` flag (CI passes it too) stamps the host-contract
-references — including the ones embedded in attribute blobs — at `1.0.0.0`,
-which binds on any Lidarr host version. The build's `ref-version-rewriter`
-step also patches these as a fallback, so an unflagged Release build still
-produces a loadable artifact.
+The Release build stamps the host-contract references (including the host
+versions embedded in attribute blobs, which the host's schema builder
+resolves at runtime) to `1.0.0.0` via the `RewriteHostReferenceVersions`
+target, so the plugin binds on any Lidarr host version — no special build
+flags needed.
 
 The Release build also produces the shippable artifact:
 
@@ -128,7 +133,7 @@ download folder.
 | additional args | string | — | Extra yt-dlp arguments appended to every invocation (quote values with spaces). |
 | SponsorBlock | checkbox | off | Trim non-music parts via the SponsorBlock API. |
 | SponsorBlock endpoint | string | `https://sponsor.ajay.app` | SponsorBlock server base URL (self-hosted supported; scheme may be omitted, `https://` is assumed). |
-| re-encode | select | `disabled` | Re-encode audio at max quality: `disabled`, `mp3`, `aac`, `opus`, `vorbis`. Requires ffmpeg. |
+| re-encode | select | `disabled` | Re-encode audio at max quality: `disabled`, `mp3`, `aac`, `opus`, `vorbis`. `disabled` keeps the source codec (extracted losslessly via ffmpeg). |
 | min download delay (s) | number | `5` | Minimum seconds between downloads (start of the randomized pause). |
 | max download delay (s) | number | `30` | Maximum seconds between downloads (end of the randomized pause). |
 | search limit | number | `25` | Max results per search (clamped to 1–100). |
@@ -147,8 +152,8 @@ yt-dlp itself (`--sleep-requests 1 --retries 10 --retry-sleep exp=2:32`).
 ### Connection test
 
 When you save either provider, the plugin runs a bounded live check (90 s
-timeout): `yt-dlp --version`, `ffmpeg -version` (only when re-encode or
-SponsorBlock is on), and the SponsorBlock endpoint (only when on). Failures
+timeout): `yt-dlp --version`, `ffmpeg -version`, and the SponsorBlock
+endpoint (only when on). Failures
 are reported as form validation errors; the plugin-side test never blocks a
 save with an unhandled exception.
 
@@ -192,9 +197,9 @@ save with an unhandled exception.
 - **SponsorBlock 404** — the video simply has no segments (normal). If the
   endpoint check fails, verify the URL — a scheme-less host is treated as
   `https://`.
-- **Re-encode/SponsorBlock fails with "ffmpeg not found"** — install ffmpeg
-  where the Lidarr process can find it (PATH); no separate setting exists by
-  design.
+- **Fails with "ffmpeg not found"** — install ffmpeg where the Lidarr process
+  can find it (PATH); no separate setting exists by design. ffmpeg is
+  required for every download (audio extraction + metadata embedding).
 - **Downloads land in the wrong place** — the download client's *download
   folder* is where raw files are written; Lidarr's usual import rules then
   move them into your music library.

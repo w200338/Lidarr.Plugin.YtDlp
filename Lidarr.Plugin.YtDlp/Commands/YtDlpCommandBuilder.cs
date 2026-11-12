@@ -29,12 +29,35 @@ public sealed class YtDlpCommandBuilder
     public IReadOnlyList<string> BuildSearchArgs(string query, int limit) =>
         BuildFlatPrintArgs($"ytsearch{ClampLimit(limit)}:{query}");
 
+    /// <summary>
+    /// Per-entry JSON print template for flat entry inspection (album browse
+    /// URLs from the album search). Flat entries carry no per-entry title, so
+    /// each entry is re-fetched flat once to read the playlist-level metadata.
+    /// </summary>
+    public const string InspectPrintTemplate = "%(.{playlist_title,playlist_channel,playlist_id})j";
+
     /// <summary>YouTube Music album search (albums section of the music search page).</summary>
     public IReadOnlyList<string> BuildAlbumSearchArgs(string query, int limit)
     {
         var url = $"https://music.youtube.com/search?q={Uri.EscapeDataString(query)}#albums";
         return BuildFlatPrintArgs(url);
     }
+
+    /// <summary>
+    /// Flat inspection of one entry URL (e.g. an album browse URL from the
+    /// album search): one fast page fetch, prints playlist-level metadata as
+    /// JSON (one line per contained track, identical playlist fields).
+    /// </summary>
+    public IReadOnlyList<string> BuildEntryInspectArgs(string entryUrl) =>
+    [
+        "--ignore-config",
+        "--no-warnings",
+        "--no-color",
+        "--flat-playlist",
+        "--print",
+        InspectPrintTemplate,
+        entryUrl
+    ];
 
     private static List<string> BuildFlatPrintArgs(string searchTarget) =>
     [
@@ -143,8 +166,15 @@ public sealed class YtDlpCommandBuilder
         var formatName = ReencodeAudioFormats.GetYtDlpFormat(reencode);
         if (formatName == null)
         {
-            // Keep the best available audio container as-is.
-            return new List<string> { "-f", "ba/b", "--embed-metadata" };
+            // Audio only, no re-encode: "ba/b" prefers the best audio-only
+            // stream (always present on YouTube), and "-x" without
+            // --audio-format extracts it losslessly into a container that
+            // matches the source codec (opus, m4a, ogg, ...). The -x also
+            // guarantees no video is ever downloaded even if the /b fallback
+            // hits a combined video+audio stream on a non-YouTube URL, and
+            // the resulting extensions are all accepted by the host's media
+            // scanner (which does not accept .webm).
+            return new List<string> { "-f", "ba/b", "-x", "--embed-metadata" };
         }
 
         return new List<string>

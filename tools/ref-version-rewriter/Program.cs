@@ -3,7 +3,6 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text;
-using System.Text.RegularExpressions;
 using Mono.Cecil;
 
 // Rewrites the assembly-reference versions of the host-contract assemblies
@@ -37,10 +36,6 @@ using Mono.Cecil;
 // FileNotFoundException even though the plugin assembly itself loads.
 // This tool patches those embedded versions to a same-length zero version
 // so the blob byte lengths (and length prefixes) stay intact.
-//
-// Primary mitigation is building with -p:AssemblyVersion=1.0.0.0 (see CI),
-// which makes the compiler emit 1.0.0.0 everywhere; this tool is the
-// belt-and-braces fallback for builds that miss the flag.
 //
 // Stamping 1.0.0.0 keeps the reference below every released (and plausible
 // future) host assembly version, so the plugin binds against whatever host
@@ -97,27 +92,52 @@ try
     File.Move(tmp, path, overwrite: true);
 
     // Second pass: patch host versions embedded in custom-attribute blobs.
-    // UTF-8 decode/encode of the whole file is lossless, so a string-level
-    // replace is safe; each replacement keeps the exact byte length.
-    var blobPattern = new Regex(@"Lidarr\.(Core|Common|Http), Version=(\d+(?:\.\d+){0,3})");
-    var text = Encoding.UTF8.GetString(File.ReadAllBytes(path));
+    // Pure byte-level in-place overwrites: locate the ASCII prefix
+    // "Lidarr.<name>, Version=", parse the version string that follows, and
+    // when it is higher than the target, overwrite the version BYTES with a
+    // same-length zero form. Every replacement is exactly as long as the
+    // original, so metadata blob length prefixes stay valid, and no other
+    // byte of the file is touched - unlike a whole-file string decode/encode
+    // pass, which corrupts binary regions that are not valid UTF-8 (and any
+    // per-replacement length error shifts every length prefix after it).
+    var blobBytes = File.ReadAllBytes(path);
     int blobChanges = 0;
 
-    text = blobPattern.Replace(text, match =>
+    foreach (var name in hostAssemblies)
     {
-        var version = match.Groups[2].Value;
-        if (version.Length < 7 || !Version.TryParse(version, out var parsed) || parsed <= target)
+        var prefix = Encoding.ASCII.GetBytes($"{name}, Version=");
+        int pos = 0;
+        while ((pos = IndexOf(blobBytes, prefix, pos)) >= 0)
         {
-            return match.Value; // not a 4-part version, or already low enough
-        }
+            int vStart = pos + prefix.Length;
+            int vEnd = vStart;
+            while (vEnd < blobBytes.Length && IsVersionByte(blobBytes[vEnd]))
+            {
+                vEnd++;
+            }
 
-        blobChanges++;
-        return $"Lidarr.{match.Groups[1].Value}, Version=0.0.0." + new string('0', version.Length - 5);
-    });
+            int vLen = vEnd - vStart;
+            if (vLen > 0 && Version.TryParse(Ascii(blobBytes, vStart, vLen), out var parsed) && parsed > target)
+            {
+                var replacement = SameLengthZeroForm(Ascii(blobBytes, vStart, vLen));
+                for (int k = 0; k < vLen; k++)
+                {
+                    blobBytes[vStart + k] = (byte)replacement[k];
+                }
+
+                blobChanges++;
+                pos = vEnd; // continue scanning after the patched version
+            }
+            else
+            {
+                pos++; // advance at least one byte
+            }
+        }
+    }
 
     if (blobChanges > 0)
     {
-        File.WriteAllText(path, text, new UTF8Encoding(false));
+        File.WriteAllBytes(path, blobBytes);
         Console.WriteLine($"patched {blobChanges} embedded attribute-blob host version string(s)");
     }
 }
@@ -130,6 +150,50 @@ catch (Exception ex)
 
     Console.Error.WriteLine($"rewrite failed: {ex.Message}");
     return 1;
+}
+
+static int IndexOf(byte[] haystack, byte[] needle, int from)
+{
+    if (needle.Length == 0 || from < 0 || from + needle.Length > haystack.Length)
+    {
+        return -1;
+    }
+
+    for (int i = from; i <= haystack.Length - needle.Length; i++)
+    {
+        bool ok = true;
+        for (int j = 0; j < needle.Length; j++)
+        {
+            if (haystack[i + j] != needle[j])
+            {
+                ok = false;
+                break;
+            }
+        }
+
+        if (ok)
+        {
+            return i;
+        }
+    }
+
+    return -1;
+}
+
+static bool IsVersionByte(byte b) => b is >= (byte)'0' and <= (byte)'9' || b == (byte)'.';
+
+static string Ascii(byte[] bytes, int start, int len) =>
+    new string(Enumerable.Range(start, len).Select(i => (char)bytes[i]).ToArray());
+
+/// <summary>Same-length replacement that Version.TryParse reads as 0.0.0.0.</summary>
+static string SameLengthZeroForm(string version)
+{
+    if (version.Length < 6)
+    {
+        return new string('0', version.Length);
+    }
+
+    return "0.0.0." + new string('0', version.Length - 6);
 }
 
 foreach (var line in changed)

@@ -163,19 +163,35 @@ public class YtDlpIndexerTests
         return sb.ToString();
     }
 
+    /// <summary>
+    /// Canned flat search entry line: the music search page's album entries
+    /// carry ONLY {id, url} - no title/channel (that's the whole reason the
+    /// indexer re-fetches each entry for its real title).
+    /// </summary>
+    private static string BrowseLine(string id, string? url = null)
+        => $"{{\"id\":\"{id}\",\"url\":\"{url ?? $"https://music.youtube.com/browse/{id}"}\"}}";
+
     [Test]
-    public async Task AlbumFetch_composes_query_and_maps_releases()
+    public async Task AlbumFetch_resolves_real_album_titles_per_entry()
     {
         _fake.BufferBehavior = (args, ct) =>
         {
-            // Last arg is the music.youtube.com search URL.
-            var url = args.Last();
-            Assert.That(url, Does.Contain("music.youtube.com/search"));
+            var target = args.Last();
+            if (target.Contains("music.youtube.com/search", StringComparison.Ordinal))
+            {
+                return Task.FromResult(new YtDlpRunResult(0, string.Join('\n',
+                [
+                    BrowseLine("MPREb_1"),
+                    BrowseLine("MPREb_2")
+                ]), string.Empty));
+            }
 
-            return Task.FromResult(new YtDlpRunResult(0, string.Join('\n',
-            [
-                Line("abc123", "Song One", "Artist A", 213.5, "video")
-            ]), string.Empty));
+            // Entry inspection (flat re-fetch): one line of playlist metadata.
+            // MPREb_1 also resolves its embedded album playlist (OLAK...);
+            // MPREb_2 does not (fallback to the browse URL).
+            return target.Contains("MPREb_1", StringComparison.Ordinal)
+                ? Task.FromResult(new YtDlpRunResult(0, "{\"playlist_title\":\"Album - Great Album\",\"playlist_channel\":null,\"playlist_id\":\"OLAK5_test1\"}", string.Empty))
+                : Task.FromResult(new YtDlpRunResult(0, "{\"playlist_title\":\"Album - Another Album\"}", string.Empty));
         };
 
         var releases = await _indexer.Fetch(new AlbumSearchCriteria
@@ -185,26 +201,62 @@ public class YtDlpIndexerTests
             Disambiguation = string.Empty
         });
 
-        Assert.That(releases, Has.Count.EqualTo(1));
+        Assert.That(releases, Has.Count.EqualTo(2));
 
         var r = releases[0];
         Assert.Multiple(() =>
         {
-            Assert.That(r.Title, Is.EqualTo("Artist A - Song One"),
-                "host parser needs 'Artist - Album' shape (ParseAlbumTitleWithSearchCriteria)");
+            Assert.That(r.Title, Is.EqualTo("Artist A - Great Album"),
+                "criteria artist + resolved album title ('Album - ' page prefix stripped); host parser needs 'Artist - Album' shape");
             Assert.That(r.Artist, Is.EqualTo("Artist A"));
-            Assert.That(r.Album, Is.EqualTo("Song One"));
-            Assert.That(r.Guid, Is.EqualTo("7_abc123"), "CleanupReleases prefixes Definition.Id");
+            Assert.That(r.Album, Is.EqualTo("Great Album"));
+            Assert.That(r.Guid, Is.EqualTo("7_MPREb_1"), "CleanupReleases prefixes Definition.Id");
             Assert.That(r.Indexer, Is.EqualTo("TestIndexer"));
             Assert.That(r.IndexerPriority, Is.EqualTo(25));
-            Assert.That(r.DownloadUrl, Is.EqualTo("https://www.youtube.com/watch?v=abc123"));
-            Assert.That(r.InfoUrl, Is.EqualTo("https://www.youtube.com/watch?v=abc123"));
+            Assert.That(r.DownloadUrl, Is.EqualTo("https://www.youtube.com/playlist?list=OLAK5_test1"),
+                "inspection resolved the embedded album playlist → canonical playlist URL (the download client's accepted contract)");
+            Assert.That(r.InfoUrl, Is.EqualTo("https://music.youtube.com/browse/MPREb_1"),
+                "the browse page stays the human-facing link");
             Assert.That(r.Size, Is.EqualTo(0), "unknown size → host skips size specifications");
-            Assert.That(r.PublishDate, Is.EqualTo(DateTime.MinValue));
+            Assert.That(r.PublishDate, Is.EqualTo(DateTime.UtcNow).Within(TimeSpan.FromMinutes(1)),
+                "search time; flat search has no release date (MinValue rendered as a 739k-day age)");
             Assert.That(r.DownloadProtocol, Is.EqualTo(nameof(NzbDrone.Core.Indexers.YtDlpDownloadProtocol)),
                 "CleanupReleases stamps the protocol from the indexer");
             Assert.That(r.IndexerId, Is.EqualTo(7));
         });
+
+        // Honest per-entry titles: the second ranked entry is a different album
+        // and must show its real name (the decision engine will reject it for
+        // the "Great Album" search - that is the correct signal).
+        Assert.That(releases[1].Title, Is.EqualTo("Artist A - Another Album"));
+        Assert.That(releases[1].DownloadUrl, Is.EqualTo("https://music.youtube.com/browse/MPREb_2"),
+            "no playlist id resolved → browse URL, which the download client also accepts");
+    }
+
+    [Test]
+    public async Task AlbumFetch_falls_back_to_criteria_title_when_inspection_fails()
+    {
+        _fake.BufferBehavior = (args, ct) =>
+        {
+            var target = args.Last();
+            if (target.Contains("music.youtube.com/search", StringComparison.Ordinal))
+            {
+                return Task.FromResult(new YtDlpRunResult(0, BrowseLine("MPREb_1"), string.Empty));
+            }
+
+            return Task.FromResult(new YtDlpRunResult(1, string.Empty, "inspection exploded"));
+        };
+
+        var releases = await _indexer.Fetch(new AlbumSearchCriteria
+        {
+            Artist = new Artist { Name = "Artist A" },
+            AlbumTitle = "Great Album"
+        });
+
+        Assert.That(releases, Has.Count.EqualTo(1), "resolution failure must not drop the entry");
+        Assert.That(releases[0].Title, Is.EqualTo("Artist A - Great Album"),
+            "criteria-derived fallback title is still parseable by the host");
+        Assert.That(releases[0].DownloadUrl, Is.EqualTo("https://music.youtube.com/browse/MPREb_1"));
     }
 
     [Test]
@@ -306,7 +358,45 @@ public class YtDlpIndexerTests
             Assert.That(mapped, Is.Not.Null);
             Assert.That(mapped!.Artist, Is.EqualTo("Fallback"), "blank channel → fallback artist");
             Assert.That(mapped.Title, Is.EqualTo("Fallback - Solo Song"));
+            Assert.That(mapped.PublishDate, Is.EqualTo(DateTime.UtcNow).Within(TimeSpan.FromMinutes(1)),
+                "search time (DateTime.MinValue rendered as a 739k-day age in the UI)");
         });
+    }
+
+    [Test]
+    public void MapAlbumRelease_prefers_resolved_title_then_criteria_then_query()
+    {
+        var entry = new SearchEntry("MPREb_1", "https://music.youtube.com/browse/MPREb_1", "", "", null, "playlist");
+
+        // 1. Resolved (real album title from the flat re-fetch) wins. A resolved
+        //    playlist id upgrades the download URL to the canonical playlist.
+        var r1 = YtDlpIndexer.MapAlbumRelease(entry, "Artist A", "Great Album", "Artist A Great Album", new EntryResolution("Real Album", null, "OLAK5_test1"));
+        Assert.Multiple(() =>
+        {
+            Assert.That(r1, Is.Not.Null);
+            Assert.That(r1!.Title, Is.EqualTo("Artist A - Real Album"));
+            Assert.That(r1.Artist, Is.EqualTo("Artist A"));
+            Assert.That(r1.Album, Is.EqualTo("Real Album"));
+            Assert.That(r1.PublishDate, Is.EqualTo(DateTime.UtcNow).Within(TimeSpan.FromMinutes(1)));
+            Assert.That(r1.DownloadUrl, Is.EqualTo("https://www.youtube.com/playlist?list=OLAK5_test1"),
+                "resolved playlist id → canonical playlist URL");
+        });
+
+        // 1b. Resolved title but no playlist id → browse URL fallback.
+        var r1b = YtDlpIndexer.MapAlbumRelease(entry, "Artist A", "Great Album", "Artist A Great Album", new EntryResolution("Real Album", null, null));
+        Assert.That(r1b!.DownloadUrl, Is.EqualTo("https://music.youtube.com/browse/MPREb_1"));
+
+        // 2. No resolution → criteria album title (parseable: it IS what the user searched).
+        var r2 = YtDlpIndexer.MapAlbumRelease(entry, "Artist A", "Great Album", "Artist A Great Album", null);
+        Assert.That(r2!.Title, Is.EqualTo("Artist A - Great Album"));
+
+        // 3. No criteria album either (artist-only search) → the whole query.
+        var r3 = YtDlpIndexer.MapAlbumRelease(entry, "Artist A", null, "Artist A", null);
+        Assert.That(r3!.Title, Is.EqualTo("Artist A - Artist A"), "still the 'Artist - X' shape");
+
+        // 4. Unusable entries are dropped.
+        Assert.That(YtDlpIndexer.MapAlbumRelease(new SearchEntry("", "https://x", "", "", null, "playlist"), "A", "B", "A B", null), Is.Null);
+        Assert.That(YtDlpIndexer.MapAlbumRelease(new SearchEntry("id", "ftp://x", "", "", null, "playlist"), "A", "B", "A B", null), Is.Null);
     }
 
     [Test]
