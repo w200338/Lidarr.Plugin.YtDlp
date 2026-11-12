@@ -22,7 +22,7 @@
       GitHub update check. Keep it a plain "major.minor[.patch]" so
       PluginVersion.Parse succeeds.
     -->
-    <InformationalVersion>0.2.0</InformationalVersion>
+    <InformationalVersion>0.2.1</InformationalVersion>
     <!--
       Copy resolved NuGet reference assemblies into the output folder so the
       Release-only ILRepack step can merge CliWrap in. Host project references
@@ -80,7 +80,18 @@
   -->
   <PropertyGroup>
     <ZipToolsDir>$(MSBuildProjectDirectory)/../tools/zip-packager</ZipToolsDir>
+    <RefRewriterDir>$(MSBuildProjectDirectory)/../tools/ref-version-rewriter</RefRewriterDir>
     <ZipArtifactDir>$(MSBuildProjectDirectory)/../artifacts</ZipArtifactDir>
+    <!--
+      The host-contract assemblies (Lidarr.Core/Common/Http) are referenced
+      at the version of the locally built host submodule (10.0.0.*), which is
+      HIGHER than any installed host's assembly version (e.g. 3.1.6.5079).
+      The runtime refuses to bind a higher requested version, so the host
+      aborts startup with "Could not load file or assembly 'Lidarr.Core,
+      Version=10.0.0.x'". After the merge we stamp those references to this
+      version so they bind against whatever host the plugin is installed in.
+    -->
+    <HostRefTargetVersion>1.0.0.0</HostRefTargetVersion>
   </PropertyGroup>
 
   <!--
@@ -96,7 +107,17 @@
     <Delete Files="@(_ExtraneousOutput)" />
   </Target>
 
-  <Target Name="ZipRelease" AfterTargets="MergePluginDependencies" Condition="'$(Configuration)' == 'Release' and '$(SkipMerge)' != 'true' and '$(IsCrossTargetingBuild)' != 'true'">
+  <!--
+    Stamp host-contract reference versions in the merged DLL (Release only).
+    See <HostRefTargetVersion> above for why this is required.
+  -->
+  <Target Name="RewriteHostReferenceVersions" AfterTargets="MergePluginDependencies" Condition="'$(Configuration)' == 'Release' and '$(SkipMerge)' != 'true' and '$(IsCrossTargetingBuild)' != 'true'">
+    <Exec Command="dotnet build &quot;$(RefRewriterDir)/ref-version-rewriter.csproj&quot; -c Release -v q --nologo" />
+    <Exec Command="dotnet &quot;$(RefRewriterDir)/bin/Release/net8.0/ref-version-rewriter.dll&quot; &quot;$(TargetDir)Lidarr.Plugin.YtDlp.dll&quot; &quot;$(HostRefTargetVersion)&quot;" EnvironmentVariables="DOTNET_ROLL_FORWARD=Major" />
+    <Message Importance="high" Text="Stamped host-contract references to $(HostRefTargetVersion) in $(TargetDir)Lidarr.Plugin.YtDlp.dll" />
+  </Target>
+
+  <Target Name="ZipRelease" AfterTargets="RewriteHostReferenceVersions" Condition="'$(Configuration)' == 'Release' and '$(SkipMerge)' != 'true' and '$(IsCrossTargetingBuild)' != 'true'">
     <MakeDir Directories="$(ZipArtifactDir)" />
     <Exec Command="dotnet build &quot;$(ZipToolsDir)/zip-packager.csproj&quot; -c Release -v q --nologo" />
     <!--

@@ -37,7 +37,7 @@ jobs:
       # is pinned external code with TreatWarningsAsErrors=true; disabling the
       # audit and analyzers keeps the build hermetic.
       - name: Build (Release, ILRepack merge + zip)
-        run: dotnet build Lidarr.Plugin.YtDlp.sln --configuration Release -v minimal -p:NuGetAudit=false -p:EnableAnalyzers=false
+        run: dotnet build Lidarr.Plugin.YtDlp.sln --configuration Release -v minimal -p:NuGetAudit=false -p:EnableAnalyzers=false -p:AssemblyVersion=1.0.0.0
 
       - name: Test
         run: dotnet test Lidarr.Plugin.YtDlp.Tests/Lidarr.Plugin.YtDlp.Tests.csproj --configuration Release --no-build

@@ -293,13 +293,73 @@ shape than the plan sketch:
   leakage (except the intentional `YtDlpDownloadProtocol` marker), type-load
   + provider-instantiation smoke against the host assemblies.
 
+### Load-compatibility fix (v0.2.1, 2026-11-12)
+
+The user's `v3.1.6.5079` host refused the v0.2.0 artifact with
+`ReflectionTypeLoadException` → `Could not load file or assembly 'Lidarr.Core,
+Version=10.0.0.17987'`. Reproduced and root-caused against a pristine official
+`v3.1.6.5079` host in this environment.
+
+**Problem 1 — assembly references.** The host submodule's
+`src/Directory.Build.props` sets `<AssemblyVersion>10.0.0.*</AssemblyVersion>`
+("should be replaced by CI" — official CI stamps the release version, e.g.
+`3.1.6.5079`; a local build gets a random `10.0.0.x` revision). The .NET
+runtime binds a requested host assembly to the already-loaded copy **only when
+loaded version ≥ requested version**. `10.0.0.x` > `3.1.6.5079`, so the plugin
+ALC load of `Lidarr.Core` fails and the host aborts startup. A bind-test
+harness (same host process, only the plugin's requested version varied) proved
+it: request `10.0.0.17053` → the exact user error; request `2.1.1.0` or
+`1.0.0.0` → loads. This is also why Tubifarry (compiled against the older
+`2.1.1.0` release) loads fine on `3.1.6.5079`.
+
+**Problem 2 — custom-attribute blobs (found during live validation).** The
+plugin assembly itself loaded, but `GET /api/v1/{indexer,downloadclient}/schema`
+500'd with the same FNF. The C# compiler writes full assembly-qualified type
+names into custom-attribute blobs: `[FieldDefinition(Type = FieldType.Textbox)]`
+encodes `"NzbDrone.Core.Annotations.FieldType, Lidarr.Core, Version=10.0.0.x,
+..."` — a string that bypasses the assembly-reference table. The host's schema
+builder (`Lidarr.Http.ClientSchema.SchemaBuilder` → `ReflectionExtensions.
+GetAttribute` → `System.Reflection.TypeNameParser`) resolves those strings
+verbatim when it maps the provider settings types, and `TypeNameParser`
+demands the exact requested version. Cecil confirmed it: decoding those
+attributes in the v0.2.0 artifact threw
+`AssemblyResolutionException: 'Lidarr.Core, Version=10.0.0.x'`.
+
+**Fix (both problems, one lever).** Build with `-p:AssemblyVersion=1.0.0.0`
+(CI build step): global MSBuild properties override the submodule's
+`10.0.0.*`, so the compiler emits `1.0.0.0` in **both** the assembly-reference
+table and every embedded attribute-blob string — and `1.0.0.0` is below every
+released (and plausible future) host version, so the plugin binds against any
+host. Belt-and-braces: `tools/ref-version-rewriter` (Mono.Cecil, built on demand
+by the `RewriteHostReferenceVersions` Release target) re-stamps the
+assembly references **and** patches any remaining embedded host-version string
+(same-length byte replace, so blob length prefixes stay intact).
+
+**Problem 3 — incremental build clobber (found while validating the fix).**
+MSBuild's output copy re-copies the **unmerged** obj DLL over the merged bin
+DLL on every no-change rebuild (the `Copy` task's `SkipUnchangedFiles` check
+compares sizes first, and the merged assembly is bigger), while the merge
+target's stamp made it skip — silently shipping the unmerged DLL. Fixed by
+removing the stamp: `MergePluginDependencies` → `RewriteHostReferenceVersions`
+→ `ZipRelease` now run on **every** Release build (~3 s, self-healing,
+order-independent). Packaging tests are the final guard.
+
+**Verified on a pristine official `v3.1.6.5079` host** (fresh install folder,
+no pre-existing plugins): plugin loads with zero load errors; `/api/v1/system/
+plugins` lists `YtDlp` / `w200338`; `/api/v1/indexer/schema` returns 11
+templates including `YtDlpIndexer` "YouTube (yt-dlp)" with all 9 fields
+(correct widget types/labels/advanced flags); `/api/v1/downloadclient/schema`
+returns 19 templates including `YtDlpDownloadClient`. 200/200 tests green in
+Debug and Release (10 packaging tests, incl. the new embedded-version and
+reference-version guards).
+
 ### Remaining (needs the user's environment)
 
 1. Push all local commits to the GitLab origin (this environment has no SSH
    and cannot reach `gitlab.gitgudaim.com`).
 2. Configure the GitLab push-mirror to `https://github.com/w200338/lidarr.plugin.ytdlp`
    (mirror commits **and tags**) and confirm that GitHub repository name.
-3. Tag (e.g. `v0.2.0`) → GitLab release job publishes the zip; mirror tag →
+3. Tag (e.g. `v0.2.1`) → GitLab release job publishes the zip; mirror tag →
    GitHub release for the UI install path.
 4. Live validation on the user's host: manual install to
    `/var/lib/lidarr/plugins/w200338/lidarr-plugin-ytdlp/`, restart,

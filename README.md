@@ -43,9 +43,15 @@ Requires:
 
 ```sh
 git submodule update --init --recursive
-dotnet build Lidarr.Plugin.YtDlp.sln -c Release
+dotnet build Lidarr.Plugin.YtDlp.sln -c Release -p:AssemblyVersion=1.0.0.0
 dotnet test  Lidarr.Plugin.YtDlp.Tests/Lidarr.Plugin.YtDlp.Tests.csproj -c Release --no-build
 ```
+
+The `AssemblyVersion` flag (CI passes it too) stamps the host-contract
+references — including the ones embedded in attribute blobs — at `1.0.0.0`,
+which binds on any Lidarr host version. The build's `ref-version-rewriter`
+step also patches these as a fallback, so an unflagged Release build still
+produces a loadable artifact.
 
 The Release build also produces the shippable artifact:
 

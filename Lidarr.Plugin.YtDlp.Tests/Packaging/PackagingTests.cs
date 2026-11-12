@@ -1,5 +1,7 @@
 using System.IO.Compression;
 using System.Reflection;
+using System.Text;
+using System.Text.RegularExpressions;
 using Lidarr.Plugin.YtDlp.Settings;
 using NLog;
 using NSubstitute;
@@ -117,6 +119,83 @@ public class PackagingTests
                         or "WindowsBase" or "mscorlib" or "System.Runtime" or "System.Private.CoreLib";
             Assert.That(ok, Is.True, $"unexpected external reference: {name}");
         }
+    }
+
+    // ----- host reference versions (startup-binding guard) -----
+
+    [Test]
+    public void Merged_dll_host_references_are_stamped_below_any_host_version()
+    {
+        RequireReleaseBuild();
+
+        // The runtime binds a requested host assembly to the loaded host copy
+        // only when the loaded version is >= the requested version. The host
+        // submodule is built locally (AssemblyVersion 10.0.0.*), which is
+        // HIGHER than any installed host (3.1.6.5079) and would abort the
+        // host's startup with "Could not load file or assembly 'Lidarr.Core,
+        // Version=10.0.0.x'". The Release build stamps the references to
+        // 1.0.0.0 (RewriteHostReferenceVersions) so they bind on any host.
+        var refs = Assembly.LoadFile(MergedDll).GetReferencedAssemblies();
+
+        // Lidarr.Core and Lidarr.Common are always referenced (IIndexer /
+        // DownloadClientBase / validation types). Lidarr.Http is referenced
+        // only when the code actually uses it (HttpRequest lives in
+        // Lidarr.Common) — check it if present.
+        foreach (var name in new[] { "Lidarr.Core", "Lidarr.Common" })
+        {
+            var reference = refs.FirstOrDefault(r => r.Name == name);
+            Assert.That(reference, Is.Not.Null, $"missing host reference {name}");
+            Assert.That(reference!.Version, Is.EqualTo(new Version(1, 0, 0, 0)),
+                $"{name} reference must be stamped to 1.0.0.0 so it binds on any host version");
+        }
+
+        var httpRef = refs.FirstOrDefault(r => r.Name == "Lidarr.Http");
+        if (httpRef != null)
+        {
+            Assert.That(httpRef.Version, Is.EqualTo(new Version(1, 0, 0, 0)),
+                "Lidarr.Http reference must be stamped to 1.0.0.0 so it binds on any host version");
+        }
+    }
+
+    [Test]
+    public void Merged_dll_embeds_no_high_host_versions_in_attribute_blobs()
+    {
+        RequireReleaseBuild();
+
+        // Assembly references are not the only place a host version appears: the
+        // C# compiler also writes full assembly-qualified type names into
+        // custom-attribute blobs, e.g. [FieldDefinition(Type = FieldType.Textbox)]
+        // encodes "NzbDrone.Core.Annotations.FieldType, Lidarr.Core,
+        // Version=<compile-time version>, ...". The host's schema builder
+        // resolves those strings verbatim (TypeNameParser) when it reads the
+        // provider settings types; a compile-time version higher than the
+        // installed host (the local submodule builds 10.0.0.*) breaks
+        // GET /api/v1/{indexer,downloadclient}/schema with
+        // "Could not load file or assembly 'Lidarr.Core, Version=10.0.0.x'".
+        // The Release build compiles with -p:AssemblyVersion=1.0.0.0 and the
+        // ref-version-rewriter patches any remainder, so no embedded host
+        // version may exceed 1.0.0.0.
+        var bytes = File.ReadAllBytes(MergedDll);
+        var text = Encoding.UTF8.GetString(bytes);
+        var pattern = new Regex(@"Lidarr\.(Core|Common|Http), Version=(\d+(?:\.\d+){0,3})");
+
+        var violations = new List<string>();
+        var seen = 0;
+        foreach (Match match in pattern.Matches(text))
+        {
+            seen++;
+            if (Version.TryParse(match.Groups[2].Value, out var version) && version > new Version(1, 0, 0, 0))
+            {
+                violations.Add(match.Value);
+            }
+        }
+
+        // The [FieldDefinition] attributes on the settings types guarantee at
+        // least one embedded host version string, so zero matches means the
+        // artifact is not the merged Release build.
+        Assert.That(seen, Is.GreaterThan(0), "no embedded host version strings found - wrong artifact?");
+        Assert.That(violations, Is.Empty,
+            "embedded host versions must be <= 1.0.0.0 so they bind on any host: " + string.Join("; ", violations.Distinct()));
     }
 
     // ----- type identity regression guards -----
