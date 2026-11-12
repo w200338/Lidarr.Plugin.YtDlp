@@ -1,7 +1,7 @@
 using System.Net;
 using System.Text.Json;
 using Lidarr.Plugin.YtDlp.Probing;
-using Microsoft.Extensions.Logging;
+using NLog;
 
 namespace Lidarr.Plugin.YtDlp.SponsorBlock;
 
@@ -40,9 +40,9 @@ public sealed class SponsorBlockClient : ISponsorBlockClient, IDisposable
     private readonly HttpClient _http;
     private readonly bool _ownsHttp;
     private readonly TimeSpan _requestTimeout;
-    private readonly ILogger? _logger;
+    private readonly Logger? _logger;
 
-    public SponsorBlockClient(HttpClient? client = null, TimeSpan? requestTimeout = null, ILogger? logger = null)
+    public SponsorBlockClient(HttpClient? client = null, TimeSpan? requestTimeout = null, Logger? logger = null)
     {
         _ownsHttp = client is null;
         _http = client ?? new HttpClient { Timeout = TimeSpan.FromSeconds(10) };

@@ -1,5 +1,4 @@
 using System.Text.Json;
-using Lidarr.Plugin.Abstractions.Models;
 using Lidarr.Plugin.YtDlp.ArgParsing;
 using Lidarr.Plugin.YtDlp.Commands;
 using Lidarr.Plugin.YtDlp.Runner;
@@ -16,9 +15,9 @@ public enum YtDlpDownloadOutcome
 
 /// <summary>
 /// Runs the per-album yt-dlp pipeline: probe (metadata) → streaming download
-/// with progress parsing. Mutates the <see cref="StreamingDownloadItem"/>
-/// (progress, current track, terminal state) as it goes — the item is the
-/// host-visible state, so all updates go through it directly.
+/// with progress parsing. Mutates the <see cref="DownloadJobState"/> (progress,
+/// current track, terminal state) as it goes — the state is the
+/// client-visible state, so all updates go through it directly.
 /// </summary>
 public sealed class YtDlpAlbumDownloader
 {
@@ -39,20 +38,17 @@ public sealed class YtDlpAlbumDownloader
     public async Task<YtDlpDownloadOutcome> DownloadAsync(
         YtDlpAlbumRef album,
         string outputPath,
-        StreamingDownloadItem item,
+        DownloadJobState state,
         CancellationToken ct)
     {
-        ArgumentNullException.ThrowIfNull(item);
+        ArgumentNullException.ThrowIfNull(state);
 
         Directory.CreateDirectory(outputPath);
 
-        item.Status = StreamingDownloadStatus.Downloading;
-        item.StartedAt = DateTime.UtcNow;
-        item.LastUpdated = DateTime.UtcNow;
-        item.Progress = 0;
+        state.MarkDownloading();
 
         var url = YtDlpAlbumId.ToUrl(album);
-        var (probeOk, totalTracks) = await ProbeAlbumAsync(album, url, item, ct).ConfigureAwait(false);
+        var (probeOk, totalTracks) = await ProbeAlbumAsync(album, url, ct).ConfigureAwait(false);
         _ = probeOk; // probe is best-effort metadata; download proceeds regardless
 
         var options = new YtDlpDownloadOptions
@@ -80,21 +76,16 @@ public sealed class YtDlpAlbumDownloader
                     _ => { },
                     line =>
                     {
-                        lock (item)
+                        stderrTail.Enqueue(line);
+                        while (stderrTail.Count > StdErrTailLines)
                         {
-                            stderrTail.Enqueue(line);
-                            while (stderrTail.Count > StdErrTailLines)
-                            {
-                                stderrTail.Dequeue();
-                            }
+                            stderrTail.Dequeue();
+                        }
 
-                            if (parser.Feed(line) && DateTime.UtcNow - lastUpdate >= ProgressThrottle)
-                            {
-                                item.Progress = parser.AlbumPercent(totalTracks);
-                                item.CurrentTrack = parser.CurrentTrack;
-                                item.LastUpdated = DateTime.UtcNow;
-                                lastUpdate = item.LastUpdated;
-                            }
+                        if (parser.Feed(line) && DateTime.UtcNow - lastUpdate >= ProgressThrottle)
+                        {
+                            state.UpdateProgress(parser.AlbumPercent(totalTracks), parser.CurrentTrack);
+                            lastUpdate = DateTime.UtcNow;
                         }
                     }),
                 ct).ConfigureAwait(false);
@@ -104,21 +95,16 @@ public sealed class YtDlpAlbumDownloader
             // The runner only throws OCE on the cancellation path (see IYtDlpRunner
             // contract), so any OCE here means "canceled" — including escalations
             // and internal runner timeouts that surface as cancellation.
-            MarkTerminal(item, StreamingDownloadStatus.Cancelled, success: false, "Download was canceled.");
+            state.MarkTerminal(YtDlpJobStatus.Cancelled, success: false, "Download was canceled.");
             return YtDlpDownloadOutcome.Cancelled;
         }
 
-        // Final un-throttled sync of parser state into the item.
-        lock (item)
-        {
-            item.CurrentTrack = parser.CurrentTrack;
-            item.Progress = parser.AlbumPercent(totalTracks);
-            item.LastUpdated = DateTime.UtcNow;
-        }
+        // Final un-throttled sync of parser state into the state object.
+        state.UpdateProgress(parser.AlbumPercent(totalTracks), parser.CurrentTrack);
 
         if (result.ExitCode == 0)
         {
-            MarkTerminal(item, StreamingDownloadStatus.Completed, success: true, null);
+            state.MarkTerminal(YtDlpJobStatus.Completed, success: true, null);
             return YtDlpDownloadOutcome.Completed;
         }
 
@@ -128,17 +114,17 @@ public sealed class YtDlpAlbumDownloader
             message = message[^ErrorMaxChars..];
         }
 
-        MarkTerminal(item, StreamingDownloadStatus.Failed, success: false,
+        state.MarkTerminal(YtDlpJobStatus.Failed, success: false,
             $"yt-dlp exited with code {result.ExitCode}. {message}".Trim());
         return YtDlpDownloadOutcome.Failed;
     }
 
     /// <summary>
     /// Best-effort metadata probe via `--simulate -J` (flat for playlists so it
-    /// stays fast). Populates item.Album and returns the total track count when
-    /// known; failures are non-fatal (album stays null, count null).
+    /// stays fast). Returns the total track count when known; failures are
+    /// non-fatal (count null).
     /// </summary>
-    private async Task<(bool Ok, int? TotalTracks)> ProbeAlbumAsync(YtDlpAlbumRef album, string url, StreamingDownloadItem item, CancellationToken ct)
+    private async Task<(bool Ok, int? TotalTracks)> ProbeAlbumAsync(YtDlpAlbumRef album, string url, CancellationToken ct)
     {
         var probeArgs = album.Kind == YtDlpAlbumKind.SingleTrack
             ? _builder.BuildProbeArgs(url)
@@ -155,11 +141,9 @@ public sealed class YtDlpAlbumDownloader
             using var doc = JsonDocument.Parse(result.StandardOutput);
             var root = doc.RootElement;
 
-            var title = root.TryGetProperty("title", out var t) ? t.GetString() : null;
-            var channel = root.TryGetProperty("channel", out var c) && c.ValueKind == JsonValueKind.String
-                ? c.GetString()
-                : root.TryGetProperty("uploader", out var u) ? u.GetString() : null;
-
+            var title = root.TryGetProperty("title", out var t) && t.ValueKind == JsonValueKind.String
+                ? t.GetString()
+                : null;
             if (string.IsNullOrWhiteSpace(title))
             {
                 return (false, null);
@@ -179,40 +163,11 @@ public sealed class YtDlpAlbumDownloader
                 trackCount = 0;
             }
 
-            item.Album = new StreamingAlbum
-            {
-                Id = album.Id,
-                Title = title,
-                Artist = new StreamingArtist { Id = channel ?? string.Empty, Name = channel ?? "Unknown Artist" },
-                Type = album.Kind == YtDlpAlbumKind.SingleTrack
-                    ? StreamingAlbumType.Single
-                    : StreamingAlbumType.Album,
-                TrackCount = trackCount
-            };
-
             return (true, trackCount > 0 ? trackCount : null);
         }
         catch (JsonException)
         {
             return (false, null);
-        }
-    }
-
-    private static void MarkTerminal(StreamingDownloadItem item, StreamingDownloadStatus status, bool success, string? error)
-    {
-        lock (item)
-        {
-            item.Status = status;
-            item.IsCompleted = true;
-            item.Success = success;
-            item.CompletedAt = DateTime.UtcNow;
-            item.LastUpdated = item.CompletedAt.Value;
-            item.ErrorMessage = error;
-
-            if (status == StreamingDownloadStatus.Completed)
-            {
-                item.Progress = 100;
-            }
         }
     }
 }

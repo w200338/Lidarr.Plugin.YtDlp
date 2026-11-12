@@ -1,4 +1,3 @@
-using Lidarr.Plugin.Abstractions.Contracts;
 using Lidarr.Plugin.YtDlp.Settings;
 using Lidarr.Plugin.YtDlp.SponsorBlock;
 
@@ -6,7 +5,7 @@ namespace Lidarr.Plugin.YtDlp.Probing;
 
 /// <summary>
 /// Composes the individual external checks into one user-readable
-/// <see cref="PluginValidationResult"/>. All checks that can run independently
+/// <see cref="ConnectionTestResult"/>. All checks that can run independently
 /// do run — a failing binary doesn't suppress the ffmpeg/SponsorBlock findings
 /// (Tubifarry pattern), but checks that depend on a working yt-dlp binary are
 /// skipped after it fails (their failures would be noise).
@@ -26,42 +25,40 @@ public sealed class YtDlpConnectionTester
     /// Optional real video URL for the extraction probe (early bot-detection
     /// signal). Timeouts surface as warnings, never as failures.
     /// </param>
-    public async Task<PluginValidationResult> TestAsync(
+    public async Task<ConnectionTestResult> TestAsync(
         YtDlpSettings settings, string? probeUrl = null, CancellationToken ct = default)
     {
-        var errors = new List<string>();
+        var errors = new List<ConnectionTestError>();
         var warnings = new List<string>();
 
         var yt = await _probe.CheckYtDlpAsync(ct).ConfigureAwait(false);
-        Append(yt, errors, warnings);
+        Append(yt, "YtDlpPath", errors, warnings);
 
         if (yt.Ok)
         {
             if (settings.Reencode != ReencodeFormat.Disabled || settings.UseSponsorBlock)
             {
                 var ffmpeg = await _probe.CheckFfmpegAsync(ct).ConfigureAwait(false);
-                Append(ffmpeg, errors, warnings);
+                Append(ffmpeg, "Reencode", errors, warnings);
             }
 
             if (settings.UseSponsorBlock)
             {
                 var sb = await _sponsorBlock.CheckEndpointAsync(settings.SponsorBlockApiEndpoint, ct).ConfigureAwait(false);
-                Append(sb, errors, warnings);
+                Append(sb, "SponsorBlockApiEndpoint", errors, warnings);
             }
 
             if (!string.IsNullOrWhiteSpace(probeUrl))
             {
                 var video = await _probe.ProbeVideoAsync(probeUrl.Trim(), ct).ConfigureAwait(false);
-                Append(video, errors, warnings);
+                Append(video, "YtDlpPath", errors, warnings);
             }
         }
 
-        return errors.Count == 0
-            ? PluginValidationResult.Success(warnings.ToArray())
-            : PluginValidationResult.Failure(errors, warnings);
+        return new ConnectionTestResult(errors, warnings);
     }
 
-    private static void Append(ProbeCheckResult check, List<string> errors, List<string> warnings)
+    private static void Append(ProbeCheckResult check, string property, List<ConnectionTestError> errors, List<string> warnings)
     {
         if (check.Ok)
         {
@@ -72,7 +69,7 @@ public sealed class YtDlpConnectionTester
         }
         else if (!string.IsNullOrEmpty(check.Error))
         {
-            errors.Add(check.Error);
+            errors.Add(new ConnectionTestError(property, check.Error));
         }
     }
 }

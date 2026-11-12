@@ -1,254 +1,269 @@
-using Lidarr.Plugin.Abstractions.Contracts;
+using FluentValidation.Results;
 using Lidarr.Plugin.YtDlp.Settings;
 using NUnit.Framework;
 
 namespace Lidarr.Plugin.YtDlp.Tests.Settings;
 
-[TestFixture]
-public class YtDlpSettingsProviderTests
+/// <summary>
+/// Phase 7 (native model): the host provider-settings POCOs replace the old
+/// Abstractions ISettingsProvider. Validation is pure and deterministic (the
+/// live connection test is a separate step, see YtDlpConnectionTestTests).
+/// </summary>
+public class YtDlpSettingsTests
 {
-    private static Dictionary<string, object?> ValidSettings() => new Dictionary<string, object?>
+    [Test]
+    public void Defaults_match_documented_surface()
     {
-        ["ytDlpPath"] = "/usr/local/bin/yt-dlp",
-        ["additionalArgs"] = "",
-        ["useSponsorBlock"] = false,
-        ["sponsorBlockApiEndpoint"] = "https://sponsor.ajay.app",
-        ["reencode"] = "disabled",
-        ["minDownloadDelaySeconds"] = 5.0,
-        ["maxDownloadDelaySeconds"] = 30.0,
-        ["searchLimit"] = 25
+        var s = new YtDlpSettings();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(s.YtDlpPath, Is.Empty);
+            Assert.That(s.AdditionalArgs, Is.Empty);
+            Assert.That(s.UseSponsorBlock, Is.False);
+            Assert.That(s.SponsorBlockApiEndpoint, Is.EqualTo("https://sponsor.ajay.app"));
+            Assert.That(s.Reencode, Is.EqualTo(ReencodeFormat.Disabled));
+            Assert.That(s.MinDownloadDelaySeconds, Is.EqualTo(5));
+            Assert.That(s.MaxDownloadDelaySeconds, Is.EqualTo(30));
+            Assert.That(s.SearchLimit, Is.EqualTo(25));
+        });
+    }
+
+    [Test]
+    public void Equality_is_value_based()
+    {
+        var a = new YtDlpSettings { YtDlpPath = "yt-dlp", SearchLimit = 10 };
+        var b = new YtDlpSettings { YtDlpPath = "yt-dlp", SearchLimit = 10 };
+        b.Reencode = ReencodeFormat.Mp3;
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(a, Is.EqualTo(new YtDlpSettings { YtDlpPath = "yt-dlp", SearchLimit = 10 }));
+            Assert.That(a, Is.Not.EqualTo(b));
+            Assert.That(a.GetHashCode(), Is.EqualTo(new YtDlpSettings { YtDlpPath = "yt-dlp", SearchLimit = 10 }.GetHashCode()));
+            Assert.That(a, Is.Not.Null);
+            Assert.That(a.Equals(null), Is.False);
+        });
+    }
+
+    [Test]
+    public void Indexer_settings_carry_host_required_members()
+    {
+        var s = new YtDlpIndexerSettings();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(s, Is.InstanceOf<NzbDrone.Core.Indexers.IIndexerSettings>());
+            Assert.That(s.BaseUrl, Is.Empty);
+            Assert.That(s.EarlyReleaseLimit, Is.Null);
+        });
+    }
+
+    [Test]
+    public void Client_settings_carry_download_path()
+    {
+        var s = new YtDlpClientSettings();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(s, Is.InstanceOf<NzbDrone.Core.ThingiProvider.IProviderConfig>());
+            Assert.That(s.DownloadPath, Is.Empty);
+        });
+    }
+}
+
+public class YtDlpSettingsValidatorTests
+{
+    private static YtDlpIndexerSettings Valid() => new()
+    {
+        YtDlpPath = "yt-dlp",
+        MinDownloadDelaySeconds = 5,
+        MaxDownloadDelaySeconds = 30,
+        SearchLimit = 25,
+        SponsorBlockApiEndpoint = YtDlpSettings.DefaultSponsorBlockEndpoint
     };
 
-    private static Dictionary<string, object?> With(IReadOnlyDictionary<string, object?> baseDict, params (string Key, object? Value)[] overrides)
-    {
-        var dict = new Dictionary<string, object?>(baseDict);
-        foreach (var (key, value) in overrides)
-        {
-            dict[key] = value;
-        }
-
-        return dict;
-    }
-
     [Test]
-    public void GetDefaults_returns_all_keys_with_documented_defaults()
+    public void Valid_settings_pass()
     {
-        var defaults = new YtDlpSettingsProvider().GetDefaults();
-
-        Assert.That(defaults.Count, Is.EqualTo(8));
-        Assert.That(defaults["ytDlpPath"], Is.EqualTo(""));
-        Assert.That(defaults["additionalArgs"], Is.EqualTo(""));
-        Assert.That(defaults["useSponsorBlock"], Is.EqualTo(false));
-        Assert.That(defaults["sponsorBlockApiEndpoint"], Is.EqualTo("https://sponsor.ajay.app"));
-        Assert.That(defaults["reencode"], Is.EqualTo("disabled"));
-        Assert.That(defaults["minDownloadDelaySeconds"], Is.EqualTo(5.0));
-        Assert.That(defaults["maxDownloadDelaySeconds"], Is.EqualTo(30.0));
-        Assert.That(defaults["searchLimit"], Is.EqualTo(25));
-    }
-
-    [Test]
-    public void Describe_exposes_all_settings_with_correct_types()
-    {
-        var definitions = new YtDlpSettingsProvider().Describe().ToDictionary(d => d.Key, d => d);
-
-        Assert.That(definitions.Count, Is.EqualTo(8));
-        Assert.That(definitions["ytDlpPath"].DataType, Is.EqualTo(SettingDataType.String));
-        Assert.That(definitions["ytDlpPath"].IsRequired, Is.True);
-        Assert.That(definitions["additionalArgs"].DataType, Is.EqualTo(SettingDataType.String));
-        Assert.That(definitions["useSponsorBlock"].DataType, Is.EqualTo(SettingDataType.Boolean));
-        Assert.That(definitions["sponsorBlockApiEndpoint"].DataType, Is.EqualTo(SettingDataType.String));
-        Assert.That(definitions["reencode"].DataType, Is.EqualTo(SettingDataType.Enum));
-        Assert.That(definitions["reencode"].AllowedValues, Is.EquivalentTo(new[] { "disabled", "mp3", "aac", "opus", "vorbis" }));
-        Assert.That(definitions["minDownloadDelaySeconds"].DataType, Is.EqualTo(SettingDataType.Number));
-        Assert.That(definitions["maxDownloadDelaySeconds"].DataType, Is.EqualTo(SettingDataType.Number));
-        Assert.That(definitions["searchLimit"].DataType, Is.EqualTo(SettingDataType.Integer));
-    }
-
-    [Test]
-    public void Validate_accepts_a_valid_settings_dictionary()
-    {
-        var result = new YtDlpSettingsProvider().Validate(ValidSettings());
+        var result = Valid().Validate();
 
         Assert.That(result.IsValid, Is.True);
         Assert.That(result.Errors, Is.Empty);
     }
 
     [Test]
-    public void Validate_rejects_missing_yt_dlp_path()
+    public void Missing_ytDlpPath_fails_with_property_tag()
     {
-        var result = new YtDlpSettingsProvider().Validate(With(ValidSettings(), ("ytDlpPath", "")));
+        var s = Valid();
+        s.YtDlpPath = string.Empty;
+
+        var result = s.Validate();
 
         Assert.That(result.IsValid, Is.False);
-        Assert.That(result.Errors, Does.Contain("Path to yt-dlp is required."));
-    }
-
-    [TestCase(30.0, 5.0)]      // min > max
-    [TestCase(-1.0, 30.0)]    // negative min
-    [TestCase(5.0, -5.0)]     // negative max
-    [TestCase(5.0, 200000.0)] // max beyond 24h ceiling
-    public void Validate_rejects_invalid_delay_values(double min, double max)
-    {
-        var dict = With(ValidSettings(),
-            ("minDownloadDelaySeconds", min),
-            ("maxDownloadDelaySeconds", max));
-
-        var result = new YtDlpSettingsProvider().Validate(dict);
-
-        Assert.That(result.IsValid, Is.False, $"expected failure for min={min} max={max}");
+        Assert.That(result.Errors.Any(e => e.PropertyName == "YtDlpPath"));
     }
 
     [Test]
-    public void Validate_accepts_zero_delay() // 0/0 = no spacing, a legal config
+    public void Unmatched_quote_in_additional_args_fails()
     {
-        var dict = With(ValidSettings(),
-            ("minDownloadDelaySeconds", 0.0),
-            ("maxDownloadDelaySeconds", 0.0));
+        var s = Valid();
+        s.AdditionalArgs = "--cookies \"unterminated";
 
-        var result = new YtDlpSettingsProvider().Validate(dict);
+        var result = s.Validate();
+
+        Assert.That(result.IsValid, Is.False);
+        Assert.That(result.Errors.Any(e => e.PropertyName == "AdditionalArgs"));
+    }
+
+    [Test]
+    public void Well_formed_additional_args_pass()
+    {
+        var s = Valid();
+        s.AdditionalArgs = "--cookies \"/home/u/cookies.txt\" --sleep-requests 2";
+
+        Assert.That(s.Validate().IsValid, Is.True);
+    }
+
+    [Test]
+    public void Min_greater_than_max_delay_fails()
+    {
+        var s = Valid();
+        s.MinDownloadDelaySeconds = 40;
+        s.MaxDownloadDelaySeconds = 30;
+
+        Assert.That(s.Validate().IsValid, Is.False);
+    }
+
+    [Test]
+    public void Equal_delays_pass()
+    {
+        var s = Valid();
+        s.MinDownloadDelaySeconds = 0;
+        s.MaxDownloadDelaySeconds = 0;
+
+        Assert.That(s.Validate().IsValid, Is.True);
+    }
+
+    [Test]
+    public void Search_limit_out_of_range_fails()
+    {
+        var s = Valid();
+        s.SearchLimit = 101;
+
+        var result = s.Validate();
+
+        Assert.That(result.IsValid, Is.False);
+        Assert.That(result.Errors.Any(e => e.PropertyName == "SearchLimit"));
+    }
+
+    [Test]
+    public void SponsorBlock_enabled_rejects_non_http_endpoint()
+    {
+        var s = Valid();
+        s.UseSponsorBlock = true;
+        s.SponsorBlockApiEndpoint = "file:///etc/passwd";
+
+        var result = s.Validate();
+
+        Assert.That(result.IsValid, Is.False);
+        Assert.That(result.Errors.Any(e => e.PropertyName == "SponsorBlockApiEndpoint"));
+    }
+
+    [Test]
+    public void SponsorBlock_enabled_accepts_scheme_less_endpoint()
+    {
+        var s = Valid();
+        s.UseSponsorBlock = true;
+        s.SponsorBlockApiEndpoint = "sponsor.ajay.app";
+
+        Assert.That(s.Validate().IsValid, Is.True);
+    }
+
+    [Test]
+    public void SponsorBlock_disabled_tolerates_garbage_endpoint()
+    {
+        var s = Valid();
+        s.UseSponsorBlock = false;
+        s.SponsorBlockApiEndpoint = "not a url at all";
+
+        Assert.That(s.Validate().IsValid, Is.True);
+    }
+
+    [Test]
+    public void SponsorBlock_enabled_rejects_empty_endpoint()
+    {
+        var s = Valid();
+        s.UseSponsorBlock = true;
+        s.SponsorBlockApiEndpoint = string.Empty;
+
+        Assert.That(s.Validate().IsValid, Is.False);
+    }
+
+    [TestCase(null, false)]
+    [TestCase("", false)]
+    [TestCase("https://sponsor.ajay.app", true)]
+    [TestCase("http://localhost:8080", true)]
+    [TestCase("sponsor.ajay.app", true)]
+    [TestCase("  https://x.y/z  ", true)]
+    [TestCase("file:///x", false)]
+    [TestCase("ftp://x", false)]
+    [TestCase("https://", false)]
+    public void Endpoint_normalization_matrix(string? raw, bool expected)
+    {
+        Assert.That(YtDlpSettingsValidator.IsValidSponsorBlockEndpoint(raw), Is.EqualTo(expected), $"raw='{raw}'");
+    }
+}
+
+public class YtDlpClientSettingsValidatorTests
+{
+    private static YtDlpClientSettings Valid(string downloadPath) => new()
+    {
+        YtDlpPath = "yt-dlp",
+        DownloadPath = downloadPath
+    };
+
+    [Test]
+    public void Valid_client_settings_pass()
+    {
+        var result = Valid("/var/lib/lidarr/ytdlp-downloads").Validate();
 
         Assert.That(result.IsValid, Is.True);
     }
 
-    [TestCase(0)]
-    [TestCase(101)]
-    [TestCase(-3)]
-    public void Validate_rejects_search_limit_out_of_range(int limit)
+    [Test]
+    public void Missing_download_path_fails()
     {
-        var result = new YtDlpSettingsProvider().Validate(With(ValidSettings(), ("searchLimit", limit)));
+        var result = Valid(string.Empty).Validate();
 
         Assert.That(result.IsValid, Is.False);
-        Assert.That(result.Errors, Does.Contain("Search limit must be between 1 and 100."));
+        Assert.That(result.Errors.Any(e => e.PropertyName == "DownloadPath"));
     }
 
-    [TestCase("wma")]
-    [TestCase("MP3;extra")]
-    [TestCase("")]
-    public void Validate_rejects_unknown_reencode_value(string reencode)
+    [Test]
+    public void Absolute_path_passes_syntactic_validation()
     {
-        var result = new YtDlpSettingsProvider().Validate(With(ValidSettings(), ("reencode", reencode)));
+        // IsValidPath is a syntactic CurrentOs check (absolute on Linux), no filesystem access.
+        Assert.That(Valid("/nonexistent/downloads/ytdlp").Validate().IsValid, Is.True);
+    }
+
+    [Test]
+    public void Relative_path_fails_syntactic_validation()
+    {
+        // Host IsPathValidForNonWindows requires a leading '/', relative paths are rejected.
+        Assert.That(Valid("downloads/ytdlp").Validate().IsValid, Is.False);
+    }
+
+    [Test]
+    public void Shared_rules_apply_to_client_settings_too()
+    {
+        var s = Valid("/tmp/x");
+        s.YtDlpPath = string.Empty;
+
+        var result = s.Validate();
 
         Assert.That(result.IsValid, Is.False);
-        Assert.That(result.Errors.Count(e => e.Contains("reencode")), Is.GreaterThan(0));
-    }
-
-    [TestCase("not a url", true)]
-    [TestCase("file:///tmp/sb", true)]
-    public void Validate_rejects_bad_sponsorblock_endpoint_when_enabled(string endpoint, bool enabled)
-    {
-        var result = new YtDlpSettingsProvider().Validate(With(ValidSettings(),
-            ("sponsorBlockApiEndpoint", endpoint), ("useSponsorBlock", enabled)));
-
-        Assert.That(result.IsValid, Is.False);
-        Assert.That(result.Errors.Count(e => e.Contains("SponsorBlock")), Is.GreaterThan(0));
-    }
-
-    [Test]
-    public void Validate_allows_schemeless_sponsorblock_endpoint_when_enabled()
-    {
-        var result = new YtDlpSettingsProvider().Validate(With(ValidSettings(),
-            ("sponsorBlockApiEndpoint", "sponsor.ajay.app"), ("useSponsorBlock", true)));
-
-        Assert.That(result.IsValid, Is.True);
-    }
-
-    [Test]
-    public void Validate_rejects_unparseable_additional_args()
-    {
-        var result = new YtDlpSettingsProvider().Validate(With(ValidSettings(), ("additionalArgs", "--foo \"unterminated")));
-
-        Assert.That(result.IsValid, Is.False);
-        Assert.That(result.Errors, Does.Contain("Additional arguments could not be parsed. Quote values that contain spaces."));
-    }
-
-    [Test]
-    public void Validate_rejects_non_boolean_use_sponsorblock()
-    {
-        var result = new YtDlpSettingsProvider().Validate(With(ValidSettings(), ("useSponsorBlock", "yes please")));
-
-        Assert.That(result.IsValid, Is.False);
-        Assert.That(result.Errors, Does.Contain("'useSponsorBlock' must be a boolean."));
-    }
-
-    [Test]
-    public void Apply_stores_snapshot_and_rejects_bad_input_without_mutation()
-    {
-        var provider = new YtDlpSettingsProvider();
-        var good = With(ValidSettings(),
-            ("ytDlpPath", "/opt/yt-dlp/yt-dlp"),
-            ("reencode", "opus"),
-            ("useSponsorBlock", true),
-            ("minDownloadDelaySeconds", 12),
-            ("searchLimit", 42));
-
-        var applied = provider.Apply(good);
-
-        Assert.That(applied.IsValid, Is.True);
-        var current = provider.Current;
-        Assert.That(current.YtDlpPath, Is.EqualTo("/opt/yt-dlp/yt-dlp"));
-        Assert.That(current.Reencode, Is.EqualTo(ReencodeFormat.Opus));
-        Assert.That(current.UseSponsorBlock, Is.True);
-        Assert.That(current.MinDownloadDelaySeconds, Is.EqualTo(12));
-        Assert.That(current.SearchLimit, Is.EqualTo(42));
-
-        var failed = provider.Apply(With(good, ("ytDlpPath", "")));
-
-        Assert.That(failed.IsValid, Is.False);
-        Assert.That(provider.Current.YtDlpPath, Is.EqualTo("/opt/yt-dlp/yt-dlp"), "failed Apply must not mutate stored settings");
-    }
-
-    [Test]
-    public void ToSettings_fills_defaults_for_missing_keys()
-    {
-        var settings = YtDlpSettingsProvider.ToSettings(new Dictionary<string, object?>
-        {
-            ["ytDlpPath"] = "yt-dlp"
-        });
-
-        Assert.That(settings.YtDlpPath, Is.EqualTo("yt-dlp"));
-        Assert.That(settings.SponsorBlockApiEndpoint, Is.EqualTo("https://sponsor.ajay.app"));
-        Assert.That(settings.Reencode, Is.EqualTo(ReencodeFormat.Disabled));
-        Assert.That(settings.MinDownloadDelaySeconds, Is.EqualTo(5));
-        Assert.That(settings.MaxDownloadDelaySeconds, Is.EqualTo(30));
-        Assert.That(settings.SearchLimit, Is.EqualTo(25));
-    }
-
-    [Test]
-    public void ToDictionary_and_ToSettings_roundtrip()
-    {
-        var original = new YtDlpSettings
-        {
-            YtDlpPath = "/bin/yt-dlp",
-            AdditionalArgs = "--proxy \"https://user:pass@host:3128\"",
-            UseSponsorBlock = true,
-            SponsorBlockApiEndpoint = "http://sb.lan:1234",
-            Reencode = ReencodeFormat.Vorbis,
-            MinDownloadDelaySeconds = 1.5,
-            MaxDownloadDelaySeconds = 45,
-            SearchLimit = 10
-        };
-
-        var roundTripped = YtDlpSettingsProvider.ToSettings(YtDlpSettingsProvider.ToDictionary(original));
-
-        Assert.That(roundTripped, Is.EqualTo(original));
-    }
-
-    [Test]
-    public void ToSettings_reads_string_encoded_values_from_host_style_dicts()
-    {
-        var settings = YtDlpSettingsProvider.ToSettings(new Dictionary<string, object?>
-        {
-            ["ytDlpPath"] = "/usr/bin/yt-dlp",
-            ["useSponsorBlock"] = "True",
-            ["reencode"] = "AAC",
-            ["minDownloadDelaySeconds"] = "7.5",
-            ["maxDownloadDelaySeconds"] = "60",
-            ["searchLimit"] = "50"
-        });
-
-        Assert.That(settings.UseSponsorBlock, Is.True);
-        Assert.That(settings.Reencode, Is.EqualTo(ReencodeFormat.Aac));
-        Assert.That(settings.MinDownloadDelaySeconds, Is.EqualTo(7.5));
-        Assert.That(settings.MaxDownloadDelaySeconds, Is.EqualTo(60));
-        Assert.That(settings.SearchLimit, Is.EqualTo(50));
+        Assert.That(result.Errors.Any(e => e.PropertyName == "YtDlpPath"),
+            "shared yt-dlp rules must apply to the client settings as well");
     }
 }

@@ -1,264 +1,359 @@
 using System.Collections.Concurrent;
-using Lidarr.Plugin.Abstractions.Contracts;
-using Lidarr.Plugin.Abstractions.Models;
+using System.Linq;
+using NLog;
+using NzbDrone.Common.Disk;
+using NzbDrone.Core.Configuration;
+using NzbDrone.Core.Download;
+using NzbDrone.Core.Exceptions;
+using NzbDrone.Core.Indexers;
+using NzbDrone.Core.Localization;
+using NzbDrone.Core.Parser.Model;
+using NzbDrone.Core.RemotePathMappings;
+using NzbDrone.Core.Validation;
+using Lidarr.Plugin.YtDlp.Probing;
 using Lidarr.Plugin.YtDlp.Queue;
 using Lidarr.Plugin.YtDlp.Runner;
 using Lidarr.Plugin.YtDlp.Settings;
+using FluentValidation.Results;
 
 namespace Lidarr.Plugin.YtDlp.Download;
 
 /// <summary>
-/// Lidarr <see cref="IDownloadClient"/> over yt-dlp.
+/// Native host <see cref="IDownloadClient"/> over yt-dlp.
 ///
-/// Design note (deliberate, per Phase 3 plan): does NOT derive from
-/// <c>BaseStreamingDownloadClient</c> — that base models an HTTP-streaming
-/// provider (Tidal/MusicBrainz-shaped). This client is process-driven: one
-/// yt-dlp download at a time, spaced out. We reuse the base's *ideas*
-/// (item lifecycle, remove/cancel semantics) directly, which keeps the class
-/// small and every behavior unit-testable.
+/// Process-driven (one yt-dlp download at a time, spaced out), so it wraps the
+/// existing single-flight <see cref="DownloadScheduler"/> instead of an HTTP
+/// queue. The host sees the standard contract:
 ///
-/// Lifecycle:
-///  Enqueue → item(Queued) → scheduler spacing → item(Downloading) →
-///  Completed | Failed | Cancelled (terminal, kept visible for a grace period
-///  so the host can inspect the result, then pruned).
+///  - <see cref="Download"/> enqueues a job and returns a stable <c>DownloadId</c>.
+///  - <see cref="GetItems"/> maps jobs to <see cref="DownloadClientItem"/> values
+///    (host DownloadItemStatus; <c>Title</c> is the host-parseable
+///    "<c>Artist - Album</c>" string used for import).
+///  - <see cref="RemoveItem"/> cancels (if running) and drops the job;
+///    <c>deleteData</c> also deletes the output folder (host helper).
+///  - <see cref="MarkItemAsImported"/> records the import (keeps the item
+///    visible until the host removes it or the grace period expires).
+///
+/// Terminal jobs stay visible for a grace period so the host can read the
+/// outcome (Completed → import; Failed → failure history).
 /// </summary>
-public sealed class YtDlpDownloadClient : IDownloadClient
+public class YtDlpDownloadClient : DownloadClientBase<YtDlpClientSettings>
 {
-    private sealed class Job
-    {
-        public required StreamingDownloadItem Item { get; init; }
-        public required CancellationTokenSource Cts { get; init; }
-    }
+    /// <summary>Bounded timeout for the settings Test() connection check.</summary>
+    private static readonly TimeSpan TestTimeout = TimeSpan.FromSeconds(90);
 
     /// <summary>Terminal items stay visible this long so the host can read the outcome.</summary>
     private static readonly TimeSpan TerminalGracePeriod = TimeSpan.FromMinutes(5);
 
-    private readonly YtDlpSettings _settings;
-    private readonly IYtDlpRunner _runner;
-    private readonly YtDlpAlbumDownloader _downloader;
-    private readonly DownloadScheduler _scheduler;
-    private readonly ConcurrentDictionary<string, Job> _jobs = new();
+    private readonly ConcurrentDictionary<string, DownloadJobState> _jobs = new();
     private readonly object _enqueueLock = new();
+    private DownloadScheduler? _scheduler;
 
-    public YtDlpDownloadClient(YtDlpSettings settings, IYtDlpRunner runner)
+    public YtDlpDownloadClient(
+        IConfigService configService,
+        IDiskProvider diskProvider,
+        IRemotePathMappingService remotePathMappingService,
+        ILocalizationService localizationService,
+        Logger logger)
+        : base(configService, diskProvider, remotePathMappingService, localizationService, logger)
     {
-        _settings = settings ?? throw new ArgumentNullException(nameof(settings));
-        _runner = runner ?? throw new ArgumentNullException(nameof(runner));
-        _downloader = new YtDlpAlbumDownloader(runner, settings);
-        _scheduler = new DownloadScheduler(
-            TimeSpan.FromSeconds(settings.MinDownloadDelaySeconds),
-            TimeSpan.FromSeconds(settings.MaxDownloadDelaySeconds));
     }
 
-    public ValueTask<PluginValidationResult> InitializeAsync(CancellationToken cancellationToken = default)
+    public override string Name => "YouTube (yt-dlp)";
+
+    public override string Protocol => nameof(YtDlpDownloadProtocol);
+
+    /// <summary>Test seam: replace the scheduler factory (spacing, execution) in unit tests.</summary>
+    internal Func<TimeSpan, TimeSpan, DownloadScheduler>? SchedulerFactoryOverride { get; set; }
+
+    private DownloadScheduler CreateScheduler()
     {
-        // Structural check only; full external verification (yt-dlp --version,
-        // ffmpeg, SponsorBlock reachability) is the Phase 5 connection test.
-        if (string.IsNullOrWhiteSpace(_settings.YtDlpPath))
-        {
-            return ValueTask.FromResult(
-                PluginValidationResult.Failure(new[] { "ytDlpPath is not configured." }));
-        }
-
-        if (_settings.MaxDownloadDelaySeconds < _settings.MinDownloadDelaySeconds)
-        {
-            return ValueTask.FromResult(
-                PluginValidationResult.Failure(new[] { "maxDownloadDelaySeconds must be >= minDownloadDelaySeconds." }));
-        }
-
-        return ValueTask.FromResult(PluginValidationResult.Success());
+        return SchedulerFactoryOverride is not null
+            ? SchedulerFactoryOverride(
+                TimeSpan.FromSeconds(Settings.MinDownloadDelaySeconds),
+                TimeSpan.FromSeconds(Settings.MaxDownloadDelaySeconds))
+            : new DownloadScheduler(
+                TimeSpan.FromSeconds(Settings.MinDownloadDelaySeconds),
+                TimeSpan.FromSeconds(Settings.MaxDownloadDelaySeconds));
     }
 
-    public ValueTask<string> EnqueueAlbumDownloadAsync(string albumId, string outputPath, CancellationToken cancellationToken = default)
+    public override Task<string> Download(RemoteAlbum remoteAlbum, IIndexer indexer)
     {
-        if (!YtDlpAlbumId.TryParse(albumId, out var album))
+        ArgumentNullException.ThrowIfNull(remoteAlbum);
+
+        var release = remoteAlbum.Release ?? throw new ReleaseDownloadException(null!, "Release is null.");
+
+        if (!YtDlpAlbumId.TryFromUrl(release.DownloadUrl, out var album))
         {
-            throw new ArgumentException(
-                $"Invalid album id '{albumId}'. Expected 'yt:<videoId>' or 'playlist:<playlistId>'.",
-                nameof(albumId));
+            throw new ReleaseDownloadException(release, "Unsupported YouTube download URL: {0}", release.DownloadUrl);
         }
 
-        if (string.IsNullOrWhiteSpace(outputPath))
-        {
-            throw new ArgumentException("outputPath is required.", nameof(outputPath));
-        }
+        var artistName = string.IsNullOrWhiteSpace(remoteAlbum.Artist?.Name)
+            ? (string.IsNullOrWhiteSpace(release.Artist) ? "Unknown Artist" : release.Artist)
+            : remoteAlbum.Artist.Name;
 
-        var normalizedId = album.ToString();
+        var albumTitle = ResolveAlbumTitle(remoteAlbum, release);
+        var title = $"{artistName} - {albumTitle}";
 
-        lock (_enqueueLock)
-        {
-            // Duplicate enqueue of the same album+path while not terminal →
-            // return the existing id (documented choice: no double downloads).
-            foreach (var job in _jobs.Values)
-            {
-                if (job.Item.IsCompleted)
-                {
-                    continue;
-                }
+        var directory = Path.Combine(Settings.DownloadPath, SanitizeDirectoryName(title));
+        Directory.CreateDirectory(directory);
 
-                if (string.Equals(job.Item.AlbumId, normalizedId, StringComparison.Ordinal)
-                    && string.Equals(job.Item.OutputPath, outputPath, StringComparison.Ordinal))
-                {
-                    return ValueTask.FromResult(job.Item.Id!);
-                }
-            }
-
-            var item = new StreamingDownloadItem
-            {
-                Id = Guid.NewGuid().ToString("N"),
-                AlbumId = normalizedId,
-                OutputPath = outputPath,
-                Status = StreamingDownloadStatus.Queued,
-                Progress = 0,
-                StartedAt = DateTime.UtcNow,
-                LastUpdated = DateTime.UtcNow,
-                CancellationToken = new CancellationTokenSource()
-            };
-
-            var newJob = new Job { Item = item, Cts = item.CancellationToken! };
-            _jobs[item.Id] = newJob;
-
-            _scheduler.Enqueue(new ScheduledJob
-            {
-                Id = item.Id,
-                Cts = newJob.Cts,
-                Run = token => RunJobAsync(newJob, album, outputPath, token)
-            });
-            _scheduler.Start();
-
-            return ValueTask.FromResult(item.Id);
-        }
+        return Task.FromResult(Enqueue(album, directory, title));
     }
 
-    public ValueTask<bool> RemoveDownloadAsync(string downloadId, bool deleteData = false, CancellationToken cancellationToken = default)
-    {
-        if (!_jobs.TryRemove(downloadId, out var job))
-        {
-            return ValueTask.FromResult(false);
-        }
-
-        try
-        {
-            job.Cts.Cancel();
-        }
-        catch (ObjectDisposedException)
-        {
-            // already disposed
-        }
-
-        if (deleteData && !string.IsNullOrWhiteSpace(job.Item.OutputPath))
-        {
-            DeleteOutputBestEffort(job.Item.OutputPath);
-        }
-
-        return ValueTask.FromResult(true);
-    }
-
-    public ValueTask<IReadOnlyList<StreamingDownloadItem>> GetActiveDownloadsAsync(CancellationToken cancellationToken = default)
+    public override IEnumerable<DownloadClientItem> GetItems()
     {
         var now = DateTime.UtcNow;
-        var snapshot = _jobs.Values
-            .Where(j => !j.Item.IsCompleted
-                        || (j.Item.CompletedAt != null && now - j.Item.CompletedAt.Value < TerminalGracePeriod))
-            .Select(j => j.Item)
+        var items = _jobs.Values
+            .Where(j => !j.IsCompleted
+                        || (j.CompletedAt.HasValue && now - j.CompletedAt.Value < TerminalGracePeriod))
+            .Select(MapItem)
             .ToList();
 
         PruneExpiredTerminalJobs(now);
-        return ValueTask.FromResult<IReadOnlyList<StreamingDownloadItem>>(snapshot);
+        return items;
     }
 
-    public ValueTask<StreamingDownloadItem?> GetDownloadAsync(string downloadId, CancellationToken cancellationToken = default)
+    public override void RemoveItem(DownloadClientItem item, bool deleteData)
     {
-        return ValueTask.FromResult(_jobs.TryGetValue(downloadId, out var job) ? job.Item : null);
-    }
+        if (item == null)
+        {
+            return;
+        }
 
-    public async ValueTask DisposeAsync()
-    {
-        foreach (var job in _jobs.Values)
+        if (_jobs.TryRemove(item.DownloadId, out var job))
         {
             try
             {
-                job.Cts.Cancel();
+                job.Cts.Cancel(); // no-op for terminal jobs
             }
             catch (ObjectDisposedException)
             {
                 // already disposed
             }
-        }
 
-        _jobs.Clear();
-        await _scheduler.DisposeAsync().ConfigureAwait(false);
+            if (deleteData)
+            {
+                DeleteItemData(item);
+            }
+        }
     }
 
-    private async Task RunJobAsync(Job job, YtDlpAlbumRef album, string outputPath, CancellationToken token)
+    public override DownloadClientInfo GetStatus()
     {
+        return new DownloadClientInfo
+        {
+            IsLocalhost = false,
+            OutputRootFolders = new List<OsPath>
+            {
+                new(string.IsNullOrWhiteSpace(Settings.DownloadPath) ? "." : Settings.DownloadPath)
+            }
+        };
+    }
+
+    public override void MarkItemAsImported(DownloadClientItem item)
+    {
+        if (item == null)
+        {
+            return;
+        }
+
+        if (_jobs.TryGetValue(item.DownloadId, out var job))
+        {
+            job.MarkImported();
+        }
+    }
+
+    protected override void Test(List<ValidationFailure> failures)
+    {
+        if (string.IsNullOrWhiteSpace(Settings.DownloadPath))
+        {
+            failures.Add(new NzbDroneValidationFailure("DownloadPath", "Download folder is required."));
+            return;
+        }
+
+        // Best effort: create the root folder if it does not exist yet so the
+        // test (and first download) can succeed on a fresh setup.
         try
         {
-            await _downloader.DownloadAsync(album, outputPath, job.Item, token).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException)
-        {
-            MarkCancelled(job.Item);
+            Directory.CreateDirectory(Settings.DownloadPath);
         }
         catch (Exception ex)
         {
-            // Defense in depth: the downloader maps failures to item state;
-            // anything escaping here is unexpected. Fail the job, keep queue alive.
-            MarkFailed(job.Item, $"Unexpected error: {ex.Message}");
+            failures.Add(new NzbDroneValidationFailure("DownloadPath", "Could not create download folder: " + ex.Message));
+            return;
+        }
+
+        var folderFailure = TestFolder(Settings.DownloadPath, "DownloadPath");
+        if (folderFailure != null)
+        {
+            failures.Add(folderFailure);
+        }
+
+        using var cts = new CancellationTokenSource(TestTimeout);
+        var result = YtDlpConnectionTest.Run(Settings, cts.Token);
+
+        foreach (var error in result.Errors)
+        {
+            failures.Add(new ValidationFailure(error.Property, error.Message));
+        }
+
+        foreach (var warning in result.Warnings)
+        {
+            _logger.Warn("[{0}] {1}", Name, warning);
         }
     }
 
-    private static void MarkCancelled(StreamingDownloadItem item)
+    // ----- internals -----
+
+    private string Enqueue(YtDlpAlbumRef album, string outputPath, string title)
     {
-        lock (item)
+        var normalizedAlbum = album.ToString();
+
+        lock (_enqueueLock)
         {
-            item.Status = StreamingDownloadStatus.Cancelled;
-            item.IsCompleted = true;
-            item.Success = false;
-            item.CompletedAt = DateTime.UtcNow;
-            item.LastUpdated = item.CompletedAt.Value;
-            item.ErrorMessage ??= "Download was canceled.";
+            // Duplicate enqueue of the same album+path while not terminal →
+            // return the existing id (no double downloads).
+            foreach (var job in _jobs.Values)
+            {
+                if (job.IsCompleted)
+                {
+                    continue;
+                }
+
+                if (string.Equals(album.ToString(), normalizedAlbum, StringComparison.Ordinal)
+                    && string.Equals(job.OutputPath, outputPath, StringComparison.Ordinal))
+                {
+                    return job.Id;
+                }
+            }
+
+            var state = new DownloadJobState
+            {
+                Id = Guid.NewGuid().ToString("N"),
+                Album = album,
+                OutputPath = outputPath,
+                Title = title
+            };
+            _jobs[state.Id] = state;
+
+            var scheduler = _scheduler ??= CreateScheduler();
+            scheduler.Enqueue(new ScheduledJob
+            {
+                Id = state.Id,
+                Cts = state.Cts,
+                Run = token => RunJobAsync(state, token)
+            });
+            scheduler.Start();
+
+            return state.Id;
         }
     }
 
-    private static void MarkFailed(StreamingDownloadItem item, string error)
+    private async Task RunJobAsync(DownloadJobState state, CancellationToken token)
     {
-        lock (item)
+        var runner = YtDlpRunners.For(Settings.YtDlpPath);
+        var downloader = new YtDlpAlbumDownloader(runner, Settings);
+
+        try
         {
-            item.Status = StreamingDownloadStatus.Failed;
-            item.IsCompleted = true;
-            item.Success = false;
-            item.CompletedAt = DateTime.UtcNow;
-            item.LastUpdated = item.CompletedAt.Value;
-            item.ErrorMessage = error;
+            await downloader.DownloadAsync(state.Album, state.OutputPath, state, token).ConfigureAwait(false);
         }
+        catch (OperationCanceledException)
+        {
+            state.MarkTerminal(YtDlpJobStatus.Cancelled, success: false, "Download was canceled.");
+        }
+        catch (Exception ex)
+        {
+            // Defense in depth: the downloader maps failures to state; anything
+            // escaping here is unexpected. Fail the job, keep the queue alive.
+            state.MarkTerminal(YtDlpJobStatus.Failed, success: false, "Unexpected error: " + ex.Message);
+            _logger.Error(ex, "[{0}] Job {1} failed unexpectedly", Name, state.Id);
+        }
+    }
+
+    private DownloadClientItem MapItem(DownloadJobState job)
+    {
+        return new DownloadClientItem
+        {
+            DownloadClientInfo = DownloadClientItemClientInfo.FromDownloadClient(this, false),
+            DownloadId = job.Id,
+            Category = string.Empty,
+            Title = job.Title,
+            TotalSize = 0,
+            RemainingSize = 0,
+            OutputPath = new OsPath(job.OutputPath),
+            Message = job.Status switch
+            {
+                YtDlpJobStatus.Queued => "Queued",
+                YtDlpJobStatus.Downloading => job.CurrentTrack is null ? "Downloading" : $"Downloading: {job.CurrentTrack}",
+                YtDlpJobStatus.Completed => "Completed",
+                YtDlpJobStatus.Cancelled => "Canceled",
+                _ => job.ErrorMessage ?? "Failed"
+            },
+            Status = job.Status switch
+            {
+                YtDlpJobStatus.Queued => DownloadItemStatus.Queued,
+                YtDlpJobStatus.Downloading => DownloadItemStatus.Downloading,
+                YtDlpJobStatus.Completed => DownloadItemStatus.Completed,
+                _ => DownloadItemStatus.Failed
+            },
+            IsEncrypted = false,
+            CanMoveFiles = false,
+            CanBeRemoved = true,
+            Removed = false
+        };
+    }
+
+    /// <summary>
+    /// Album title for the output folder / item title: prefer what the indexer
+    /// recorded on the release, then the host's matched album, then parse the
+    /// composed "<c>Artist - Album</c>" title.
+    /// </summary>
+    internal static string ResolveAlbumTitle(RemoteAlbum remoteAlbum, ReleaseInfo release)
+    {
+        if (!string.IsNullOrWhiteSpace(release.Album))
+        {
+            return release.Album;
+        }
+
+        var matched = remoteAlbum.Albums?.FirstOrDefault();
+        if (matched is not null && !string.IsNullOrWhiteSpace(matched.Title))
+        {
+            return matched.Title;
+        }
+
+        var title = release.Title ?? string.Empty;
+        var dash = title.IndexOf(" - ", StringComparison.Ordinal);
+        if (dash > 0)
+        {
+            return title[(dash + 3)..].Trim();
+        }
+
+        return title.Length == 0 ? "Unknown Album" : title;
+    }
+
+    internal static string SanitizeDirectoryName(string name)
+    {
+        foreach (var c in Path.GetInvalidFileNameChars())
+        {
+            name = name.Replace(c, ' ');
+        }
+
+        name = System.Text.RegularExpressions.Regex.Replace(name, @"\s+", " ").Trim().TrimEnd('.');
+        return string.IsNullOrWhiteSpace(name) ? "download" : name;
     }
 
     private void PruneExpiredTerminalJobs(DateTime now)
     {
         foreach (var job in _jobs.Values)
         {
-            if (job.Item.IsCompleted
-                && job.Item.CompletedAt != null
-                && now - job.Item.CompletedAt.Value >= TerminalGracePeriod)
+            if (job.IsCompleted
+                && job.CompletedAt.HasValue
+                && now - job.CompletedAt.Value >= TerminalGracePeriod)
             {
-                _jobs.TryRemove(job.Item.Id!, out _);
+                _jobs.TryRemove(job.Id, out _);
             }
-        }
-    }
-
-    private static void DeleteOutputBestEffort(string outputPath)
-    {
-        try
-        {
-            if (Directory.Exists(outputPath))
-            {
-                Directory.Delete(outputPath, recursive: true);
-            }
-        }
-        catch
-        {
-            // Best effort — host may already own/be reading the path.
         }
     }
 }

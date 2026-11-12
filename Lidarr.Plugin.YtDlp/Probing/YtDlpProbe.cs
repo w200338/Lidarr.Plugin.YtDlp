@@ -1,7 +1,7 @@
 using System.Text.RegularExpressions;
 using Lidarr.Plugin.YtDlp.Commands;
 using Lidarr.Plugin.YtDlp.Runner;
-using Microsoft.Extensions.Logging;
+using NLog;
 
 namespace Lidarr.Plugin.YtDlp.Probing;
 
@@ -35,10 +35,10 @@ public sealed class YtDlpProbe : IYtDlpProbe
     private readonly string _ytDlpPath;
     private readonly YtDlpCommandBuilder _builder = new();
     private readonly TimeSpan _videoProbeTimeout;
-    private readonly ILogger? _logger;
+    private readonly Logger? _logger;
 
     public YtDlpProbe(IYtDlpRunner ytDlp, IYtDlpRunner ffmpeg, string ytDlpPath,
-        TimeSpan? videoProbeTimeout = null, ILogger? logger = null)
+        TimeSpan? videoProbeTimeout = null, Logger? logger = null)
     {
         _ytDlp = ytDlp ?? throw new ArgumentNullException(nameof(ytDlp));
         _ffmpeg = ffmpeg ?? throw new ArgumentNullException(nameof(ffmpeg));
@@ -60,7 +60,7 @@ public sealed class YtDlpProbe : IYtDlpProbe
         }
         catch (Exception ex)
         {
-            _logger?.LogDebug(ex, "yt-dlp --version launch failed");
+            _logger?.Debug(ex, "yt-dlp --version launch failed");
             return ProbeCheckResult.Fail(BuildMissingBinaryMessage());
         }
 

@@ -3,39 +3,73 @@
     This file is REQUIRED by the ILRepack.Lib.MSBuild.Task package design:
     when a project-local ILRepack.targets exists, the package's built-in
     fallback target is suppressed. That fallback merges EVERY dll in the
-    output directory into the plugin — including host-shared
-    Lidarr.Plugin.Abstractions and Microsoft.Extensions.* — which splits
-    type identity across the host's collectible AssemblyLoadContext and
-    breaks the plugin at runtime with MissingMethodException.
+    output directory into the plugin — which, in the native host model,
+    would swallow host-contract assemblies (Lidarr.Core, NLog,
+    FluentValidation, Newtonsoft.Json) and split type identity across the
+    host's collectible AssemblyLoadContext, breaking the plugin at runtime
+    with MissingMethodException / TypeLoadException.
 
-    Instead we run a controlled, incremental merge:
-      * primary  = the freshly compiled assembly (obj), copied to bin first
-      * merged in = CliWrap + FluentValidation only (internalized + renamed)
-      * host-shared assemblies (Lidarr.Plugin.Abstractions,
-        M.E.Logging.Abstractions, M.E.DependencyInjection.Abstractions)
-        stay external so the host's PluginLoadContext keeps a single
-        type identity across the ALC boundary
+    Native-model merge set (verified against Tubifarry v2.3.1, a working
+    native plugin):
+      * primary   = the freshly compiled assembly (obj), copied to bin first
+      * merged in = CliWrap ONLY (internalized + renamed so it cannot
+                    collide with anything on the host)
+      * EXTERNAL  = Lidarr.Core, Lidarr.Common, Lidarr.Http, NLog,
+                    FluentValidation, Newtonsoft.Json (+ .NET 8 framework):
+                    the host's PluginLoadContext returns null for these,
+                    so the plugin binds against the host's own copies.
+                    FluentValidation must stay external specifically because
+                    IProvider.Test() and DownloadClientBase's
+                    Test(List<ValidationFailure>) expose host-visible
+                    FluentValidation types in their signatures.
       * a stamp file makes the merge skip when up-to-date, so an
         already-merged bin dll is never re-merged with the sidecars
   -->
+  <!--
+    ILRepack needs the external reference assemblies to be loadable while it
+    rewrites metadata. The host project DLLs are build outputs of the pinned
+    submodule (ext/Lidarr builds LidarrProject=true outputs to _output/<tfm>/).
+    Copy them into a scratch folder used as an extra LibraryPath. If any
+    reference cannot be resolved ILRepack keeps it external and warns, which
+    is the desired behavior for host-contract assemblies.
+  -->
+  <PropertyGroup>
+    <HostOutputDir>$(MSBuildProjectDirectory)/../ext/Lidarr/_output/$(TargetFramework)</HostOutputDir>
+    <HostRefDir>$(IntermediateOutputPath)host-refs</HostRefDir>
+  </PropertyGroup>
+
+  <Target Name="CollectHostReferences"
+          BeforeTargets="MergePluginDependencies"
+          Condition="Exists('$(HostOutputDir)')">
+    <MakeDir Directories="$(HostRefDir)" />
+    <ItemGroup>
+      <_HostRef Include="$(HostOutputDir)/Lidarr.Common.dll"
+                Condition="Exists('$(HostOutputDir)/Lidarr.Common.dll')" />
+      <_HostRef Include="$(HostOutputDir)/Lidarr.Core.dll"
+                Condition="Exists('$(HostOutputDir)/Lidarr.Core.dll')" />
+      <_HostRef Include="$(HostOutputDir)/Lidarr.Http.dll"
+                Condition="Exists('$(HostOutputDir)/Lidarr.Http.dll')" />
+    </ItemGroup>
+    <Copy SourceFiles="@(_HostRef)" DestinationFolder="$(HostRefDir)" SkipUnchangedFiles="true" />
+  </Target>
+
   <Target Name="MergePluginDependencies"
           AfterTargets="Build"
           Condition="'$(Configuration)' == 'Release' and '$(SkipMerge)' != 'true' and '$(IsCrossTargetingBuild)' != 'true'"
-          Inputs="$(IntermediateOutputPath)Lidarr.Plugin.YtDlp.dll;$(TargetDir)CliWrap.dll;$(TargetDir)FluentValidation.dll"
+          Inputs="$(IntermediateOutputPath)Lidarr.Plugin.YtDlp.dll;$(TargetDir)CliWrap.dll"
           Outputs="$(IntermediateOutputPath)plugin-merge.stamp">
     <Copy SourceFiles="$(IntermediateOutputPath)Lidarr.Plugin.YtDlp.dll"
           DestinationFiles="$(TargetDir)Lidarr.Plugin.YtDlp.dll" />
     <ItemGroup>
       <_MergeInput Include="$(TargetDir)Lidarr.Plugin.YtDlp.dll" />
       <_MergeInput Include="$(TargetDir)CliWrap.dll" />
-      <_MergeInput Include="$(TargetDir)FluentValidation.dll" />
     </ItemGroup>
     <ILRepack
       InputAssemblies="@(_MergeInput)"
-      LibraryPath="$(TargetDir)"
+      LibraryPath="$(TargetDir);$(HostRefDir)"
       Internalize="true"
       RenameInternalized="true"
-      InternalizeAssembly="CliWrap;FluentValidation"
+      InternalizeAssembly="CliWrap"
       InternalizeExclude="System.*"
       OutputFile="$(TargetDir)Lidarr.Plugin.YtDlp.dll"
       DebugInfo="false"
@@ -45,6 +79,6 @@
       Verbose="false"
       NoRepackRes="true" />
     <WriteLinesToFile File="$(IntermediateOutputPath)plugin-merge.stamp" Lines="merged" Overwrite="true" />
-    <Message Importance="high" Text="Merged CliWrap + FluentValidation into $(TargetDir)Lidarr.Plugin.YtDlp.dll" />
+    <Message Importance="high" Text="Merged CliWrap into $(TargetDir)Lidarr.Plugin.YtDlp.dll" />
   </Target>
 </Project>

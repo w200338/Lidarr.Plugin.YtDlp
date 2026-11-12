@@ -1,31 +1,158 @@
 using System.Text;
-using Lidarr.Plugin.Abstractions.Contracts;
-using Lidarr.Plugin.Abstractions.Models;
+using FluentValidation.Results;
 using Lidarr.Plugin.YtDlp.Indexing;
+using Lidarr.Plugin.YtDlp.Probing;
 using Lidarr.Plugin.YtDlp.Runner;
 using Lidarr.Plugin.YtDlp.Settings;
 using Lidarr.Plugin.YtDlp.Tests.Support;
+using NLog;
+using NSubstitute;
+using NzbDrone.Core.Configuration;
+using NzbDrone.Core.Indexers;
+using NzbDrone.Core.IndexerSearch.Definitions;
+using NzbDrone.Core.Music;
+using NzbDrone.Core.Parser;
+using NzbDrone.Core.Parser.Model;
+using NzbDrone.Core.ThingiProvider;
 
 namespace Lidarr.Plugin.YtDlp.Tests.Indexing;
 
+/// <summary>
+/// Phase 7 (native model): YtDlpIndexer now derives from the host
+/// IndexerBase&lt;YtDlpIndexerSettings&gt;. The decision-engine contract (the
+/// ReleaseInfo shape) is the part that must stay pinned, plus the host-facing
+/// plumbing (DefaultDefinitions, Test, GetDownloadRequest).
+/// </summary>
 public class YtDlpIndexerTests
 {
-    private static YtDlpSettings Settings() => new()
-    {
-        YtDlpPath = "yt-dlp",
-        SearchLimit = 25
-    };
+    private YtDlpIndexer _indexer = null!;
+    private FakeYtDlpRunner _fake = null!;
+    private Func<string, IYtDlpRunner>? _previousFactory;
 
-    private static FakeYtDlpRunner Fake(IReadOnlyList<string> lines)
+    [SetUp]
+    public void SetUp()
     {
-        return new FakeYtDlpRunner
+        _fake = new FakeYtDlpRunner();
+        _previousFactory = YtDlpRunners.Factory;
+        YtDlpRunners.Factory = _ => _fake;
+
+        var settings = new YtDlpIndexerSettings
         {
-            BufferBehavior = (args, ct) => Task.FromResult(
-                new YtDlpRunResult(0, string.Join('\n', lines), string.Empty))
+            YtDlpPath = "yt-dlp",
+            SearchLimit = 25
+        };
+
+        _indexer = new YtDlpIndexer(
+            Substitute.For<IIndexerStatusService>(),
+            Substitute.For<IConfigService>(),
+            Substitute.For<IParsingService>(),
+            LogManager.GetLogger("test"));
+
+        // CleanupReleases stamps Guid/IndexerId/DownloadProtocol from the definition.
+        _indexer.Definition = new IndexerDefinition
+        {
+            Id = 7,
+            Name = "TestIndexer",
+            Priority = 25,
+            Settings = settings
         };
     }
 
-    // JSON line builder for canned search output.
+    [TearDown]
+    public void TearDown()
+    {
+        YtDlpRunners.Factory = _previousFactory!;
+        YtDlpRunners.ClearCache();
+        YtDlpConnectionTest.Override = null;
+    }
+
+    // ----- host-facing plumbing -----
+
+    [Test]
+    public void Host_surface_matches_native_contract()
+    {
+        Assert.Multiple(() =>
+        {
+            Assert.That(_indexer, Is.InstanceOf<IndexerBase<YtDlpIndexerSettings>>());
+            Assert.That(_indexer.Name, Is.EqualTo("YouTube (yt-dlp)"));
+            Assert.That(_indexer.Protocol, Is.EqualTo(nameof(NzbDrone.Core.Indexers.YtDlpDownloadProtocol)));
+            Assert.That(_indexer.SupportsRss, Is.False);
+            Assert.That(_indexer.SupportsSearch, Is.True);
+            Assert.That(_indexer.ConfigContract, Is.EqualTo(typeof(YtDlpIndexerSettings)));
+        });
+    }
+
+    [Test]
+    public void DefaultDefinitions_enables_interactive_search()
+    {
+        var definitions = _indexer.DefaultDefinitions.OfType<IndexerDefinition>().ToList();
+
+        Assert.That(definitions, Has.Count.EqualTo(1));
+
+        var d = definitions[0];
+        Assert.Multiple(() =>
+        {
+            Assert.That(d.Name, Is.Null, "Name=null → ProviderFactory picks this as the add-template");
+            Assert.That(d.Implementation, Is.EqualTo(nameof(YtDlpIndexer)), "factory matches implementation by type name");
+            Assert.That(d.EnableRss, Is.False);
+            Assert.That(d.EnableAutomaticSearch, Is.False);
+            Assert.That(d.EnableInteractiveSearch, Is.True);
+            Assert.That(d.Settings, Is.InstanceOf<YtDlpIndexerSettings>());
+        });
+    }
+
+    [Test]
+    public async Task FetchRecent_returns_empty()
+    {
+        Assert.That(await _indexer.FetchRecent(), Is.Empty);
+    }
+
+    [Test]
+    public void GetDownloadRequest_wraps_link_in_get_request()
+    {
+        var link = "https://www.youtube.com/watch?v=abc123";
+        var request = _indexer.GetDownloadRequest(link);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(request.Url.ToString(), Is.EqualTo(link));
+            Assert.That(request.Method, Is.EqualTo(System.Net.Http.HttpMethod.Get));
+        });
+    }
+
+    [Test]
+    public void Test_maps_connection_errors_to_validation_failures()
+    {
+        YtDlpConnectionTest.Override = (s, ct) => Task.FromResult(new ConnectionTestResult(
+            new[]
+            {
+                new ConnectionTestError("YtDlpPath", "yt-dlp not found at 'yt-dlp'.")
+            },
+            new[] { "unexpected yt-dlp output" }));
+
+        var result = _indexer.Test();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(result.IsValid, Is.False);
+            Assert.That(result.Errors.Any(e => e.PropertyName == "YtDlpPath"));
+            Assert.That(result.Errors.Any(e => e.ErrorMessage == "yt-dlp not found at 'yt-dlp'."));
+        });
+    }
+
+    [Test]
+    public void Test_passes_when_connection_test_succeeds()
+    {
+        YtDlpConnectionTest.Override = (s, ct) => Task.FromResult(new ConnectionTestResult(
+            Array.Empty<ConnectionTestError>(),
+            Array.Empty<string>()));
+
+        Assert.That(_indexer.Test().IsValid, Is.True);
+    }
+
+    // ----- search (host IIndexer contract) -----
+
+    /// <summary>JSON line builder for canned search output (mirrors the yt-dlp print template).</summary>
     private static string Line(string id, string title, string channel, double? dur, string type, string? url = null)
     {
         url ??= $"https://www.youtube.com/watch?v={id}";
@@ -37,232 +164,158 @@ public class YtDlpIndexerTests
     }
 
     [Test]
-    public async Task Metadata_describes_service()
+    public async Task AlbumFetch_composes_query_and_maps_releases()
     {
-        await using var indexer = new YtDlpIndexer(Settings(), new FakeYtDlpRunner());
-        Assert.That(indexer.Protocol, Is.EqualTo("ytdlp"));
-        Assert.That(indexer.PageSize, Is.EqualTo(25));
-        Assert.That(indexer.MaxPageSize, Is.EqualTo(25));
-        Assert.That(indexer.SupportsRss, Is.False);
-        Assert.That(indexer.ServiceName, Does.Contain("yt-dlp"));
-    }
-
-    [Test]
-    public void Initialize_fails_when_path_not_configured()
-    {
-        var indexer = new YtDlpIndexer(new YtDlpSettings { YtDlpPath = string.Empty }, new FakeYtDlpRunner());
-        var result = indexer.InitializeAsync().AsTask().Result;
-        Assert.That(result.IsValid, Is.False);
-    }
-
-    [Test]
-    public void Initialize_succeeds_when_path_configured()
-    {
-        var indexer = new YtDlpIndexer(Settings(), new FakeYtDlpRunner());
-        var result = indexer.InitializeAsync().AsTask().Result;
-        Assert.That(result.IsValid, Is.True);
-    }
-
-    [Test]
-    public async Task SearchTracks_maps_entries_to_tracks()
-    {
-        var fake = Fake(new[]
+        _fake.BufferBehavior = (args, ct) =>
         {
-            Line("abc123", "Song One", "Artist A", 213.5, "video"),
-            Line("def456", "Song | Two", "Artist B", 120.0, "video")
+            // Last arg is the music.youtube.com search URL.
+            var url = args.Last();
+            Assert.That(url, Does.Contain("music.youtube.com/search"));
+
+            return Task.FromResult(new YtDlpRunResult(0, string.Join('\n',
+            [
+                Line("abc123", "Song One", "Artist A", 213.5, "video")
+            ]), string.Empty));
+        };
+
+        var releases = await _indexer.Fetch(new AlbumSearchCriteria
+        {
+            Artist = new Artist { Name = "Artist A" },
+            AlbumTitle = "Great Album",
+            Disambiguation = string.Empty
         });
-        await using var indexer = new YtDlpIndexer(Settings(), fake);
 
-        var tracks = await indexer.SearchTracksAsync("some query");
+        Assert.That(releases, Has.Count.EqualTo(1));
 
-        Assert.That(tracks, Has.Count.EqualTo(2));
-        Assert.That(tracks[0].Id, Is.EqualTo("yt:abc123"));
-        Assert.That(tracks[0].Title, Is.EqualTo("Song One"));
-        Assert.That(tracks[0].Artist.Name, Is.EqualTo("Artist A"));
-        Assert.That(tracks[0].Duration, Is.EqualTo(TimeSpan.FromSeconds(213.5)));
-        Assert.That((string)tracks[0].Metadata["url"], Is.EqualTo("https://www.youtube.com/watch?v=abc123"));
-
-        // '|' in a title survives the JSON round-trip intact.
-        Assert.That(tracks[1].Title, Is.EqualTo("Song | Two"));
-
-        // The search used the ytsearchN: prefix.
-        var call = fake.Calls.Single();
-        Assert.That(call.Last(), Does.StartWith("ytsearch"));
-    }
-
-    [Test]
-    public async Task SearchTracks_dedupes_by_id_and_caps_at_limit()
-    {
-        var settings = Settings();
-        settings.SearchLimit = 2;
-        var fake = Fake(new[]
+        var r = releases[0];
+        Assert.Multiple(() =>
         {
-            Line("a", "A", "X", 1, "video"),
-            Line("b", "B", "X", 2, "video"),
-            Line("a", "A dup", "X", 3, "video"),
-            Line("c", "C", "X", 4, "video"),
-            Line("d", "D", "X", 5, "video")
+            Assert.That(r.Title, Is.EqualTo("Artist A - Song One"),
+                "host parser needs 'Artist - Album' shape (ParseAlbumTitleWithSearchCriteria)");
+            Assert.That(r.Artist, Is.EqualTo("Artist A"));
+            Assert.That(r.Album, Is.EqualTo("Song One"));
+            Assert.That(r.Guid, Is.EqualTo("7_abc123"), "CleanupReleases prefixes Definition.Id");
+            Assert.That(r.Indexer, Is.EqualTo("TestIndexer"));
+            Assert.That(r.IndexerPriority, Is.EqualTo(25));
+            Assert.That(r.DownloadUrl, Is.EqualTo("https://www.youtube.com/watch?v=abc123"));
+            Assert.That(r.InfoUrl, Is.EqualTo("https://www.youtube.com/watch?v=abc123"));
+            Assert.That(r.Size, Is.EqualTo(0), "unknown size → host skips size specifications");
+            Assert.That(r.PublishDate, Is.EqualTo(DateTime.MinValue));
+            Assert.That(r.DownloadProtocol, Is.EqualTo(nameof(NzbDrone.Core.Indexers.YtDlpDownloadProtocol)),
+                "CleanupReleases stamps the protocol from the indexer");
+            Assert.That(r.IndexerId, Is.EqualTo(7));
         });
-        await using var indexer = new YtDlpIndexer(settings, fake);
-
-        var tracks = await indexer.SearchTracksAsync("q");
-
-        Assert.That(tracks, Has.Count.EqualTo(2));
-        Assert.That(tracks.Select(t => t.Id), Is.EqualTo(new[] { "yt:a", "yt:b" }));
     }
 
     [Test]
-    public async Task SearchTracks_returns_empty_on_runner_failure()
+    public async Task AlbumFetch_includes_disambiguation_in_query()
     {
-        var fake = new FakeYtDlpRunner
+        string? seenUrl = null;
+        _fake.BufferBehavior = (args, ct) =>
         {
-            BufferBehavior = (a, ct) => Task.FromResult(new YtDlpRunResult(1, string.Empty, "boom"))
+            seenUrl = args.Last();
+            return Task.FromResult(new YtDlpRunResult(0, string.Empty, string.Empty));
         };
-        await using var indexer = new YtDlpIndexer(Settings(), fake);
 
-        var tracks = await indexer.SearchTracksAsync("q");
-        Assert.That(tracks, Is.Empty);
-    }
-
-    [Test]
-    public async Task SearchAlbums_maps_playlists_and_single_videos()
-    {
-        var fake = Fake(new[]
+        _ = await _indexer.Fetch(new AlbumSearchCriteria
         {
-            // A playlist (channel = album artist; url is a watch URL but type says playlist).
-            Line("PL1234567890abcdef", "Some Album", "The Band", null, "playlist"),
-            // A plain video → single-track album.
-            Line("vid0000001", "Standalone Song", "Singer", 95.0, "video")
+            Artist = new Artist { Name = "  Artist A " },
+            AlbumTitle = "Great  Album",
+            Disambiguation = "(2020)"
         });
-        await using var indexer = new YtDlpIndexer(Settings(), fake);
 
-        var albums = await indexer.SearchAlbumsAsync("q");
-
-        Assert.That(albums, Has.Count.EqualTo(2));
-
-        var pl = albums[0];
-        Assert.That(pl.Id, Is.EqualTo("playlist:PL1234567890abcdef"));
-        Assert.That(pl.Title, Is.EqualTo("Some Album"));
-        Assert.That(pl.Artist.Name, Is.EqualTo("The Band"));
-        Assert.That(pl.Type, Is.EqualTo(StreamingAlbumType.Album));
-
-        var single = albums[1];
-        Assert.That(single.Id, Is.EqualTo("yt:vid0000001"));
-        Assert.That(single.TrackCount, Is.EqualTo(1));
-        Assert.That(single.Type, Is.EqualTo(StreamingAlbumType.Single));
-        Assert.That(single.Duration, Is.EqualTo(TimeSpan.FromSeconds(95.0)));
+        var url = seenUrl!;
+        var rawQuery = url[(url.IndexOf("q=", StringComparison.Ordinal) + 2)..];
+        rawQuery = rawQuery[..rawQuery.IndexOf('#', StringComparison.Ordinal)]; // strip #albums fragment
+        var query = Uri.UnescapeDataString(rawQuery);
+        Assert.That(query, Is.EqualTo("Artist A Great Album (2020)"),
+            "whitespace collapsed, parts joined with single spaces");
     }
 
     [Test]
-    public async Task SearchAlbums_skips_entries_without_id()
+    public async Task ArtistFetch_uses_generic_search()
     {
-        var fake = new FakeYtDlpRunner
+        string? seenUrl = null;
+        _fake.BufferBehavior = (args, ct) =>
         {
-            BufferBehavior = (a, ct) => Task.FromResult(new YtDlpRunResult(0,
-                "{not json}\n" + Line("vid1", "V", "A", 1, "video"), string.Empty))
+            seenUrl = args.Last();
+            return Task.FromResult(new YtDlpRunResult(0, string.Empty, string.Empty));
         };
-        await using var indexer = new YtDlpIndexer(Settings(), fake);
 
-        var albums = await indexer.SearchAlbumsAsync("q");
-        Assert.That(albums, Has.Count.EqualTo(1));
-        Assert.That(albums[0].Id, Is.EqualTo("yt:vid1"));
-    }
-
-    [Test]
-    public async Task GetAlbum_expands_playlist_probe()
-    {
-        const string probe = """"
-            {"title":"Greatest Hits","channel":"The Band","playlist":[
-              {"id":"v1","title":"T1","duration":120.0,"url":"https://www.youtube.com/watch?v=v1","type":"video"},
-              {"id":"v2","title":"T2","duration":150.5,"url":"https://www.youtube.com/watch?v=v2","type":"video"}]}
-            """";
-        var fake = new FakeYtDlpRunner
+        var releases = await _indexer.Fetch(new ArtistSearchCriteria
         {
-            BufferBehavior = (a, ct) => Task.FromResult(new YtDlpRunResult(0, probe, string.Empty))
-        };
-        await using var indexer = new YtDlpIndexer(Settings(), fake);
-
-        var album = await indexer.GetAlbumAsync("playlist:PL1234567890abcdef");
-
-        Assert.That(album, Is.Not.Null);
-        Assert.That(album!.Id, Is.EqualTo("playlist:PL1234567890abcdef"));
-        Assert.That(album.Title, Is.EqualTo("Greatest Hits"));
-        Assert.That(album.Artist.Name, Is.EqualTo("The Band"));
-        Assert.That(album.TrackCount, Is.EqualTo(2));
-
-        var tracks = (List<StreamingTrack>)album.Metadata[YtDlpIndexer.TracksMetadataKey];
-        Assert.That(tracks, Has.Count.EqualTo(2));
-        Assert.That(tracks[0].TrackNumber, Is.EqualTo(1));
-        Assert.That(tracks[1].Title, Is.EqualTo("T2"));
-        Assert.That(tracks[1].Id, Is.EqualTo("yt:v2"));
-
-        // Used the flat-playlist probe args.
-        var call = fake.Calls.Single();
-        Assert.That(call, Does.Contain("--flat-playlist"));
-        Assert.That(call, Does.Contain("-J"));
-    }
-
-    [Test]
-    public async Task GetAlbum_expands_single_video_probe()
-    {
-        const string probe = """"
-            {"id":"abc123","title":"Solo Song","channel":"Singer","duration":213.5,
-             "webpage_url":"https://www.youtube.com/watch?v=abc123"}
-            """";
-        var fake = new FakeYtDlpRunner
-        {
-            BufferBehavior = (a, ct) => Task.FromResult(new YtDlpRunResult(0, probe, string.Empty))
-        };
-        await using var indexer = new YtDlpIndexer(Settings(), fake);
-
-        var album = await indexer.GetAlbumAsync("yt:abc123");
-
-        Assert.That(album, Is.Not.Null);
-        Assert.That(album!.Id, Is.EqualTo("yt:abc123"));
-        Assert.That(album.Title, Is.EqualTo("Solo Song"));
-        Assert.That(album.TrackCount, Is.EqualTo(1));
-        Assert.That(album.Duration, Is.EqualTo(TimeSpan.FromSeconds(213.5)));
-
-        var call = fake.Calls.Single();
-        Assert.That(call, Is.Not.Empty);
-        Assert.That(call, Does.Contain("--simulate"));
-    }
-
-    [Test]
-    public async Task GetAlbum_returns_null_for_unknown_token()
-    {
-        await using var indexer = new YtDlpIndexer(Settings(), new FakeYtDlpRunner());
-        Assert.That(await indexer.GetAlbumAsync("banana"), Is.Null);
-        Assert.That(await indexer.GetAlbumAsync(""), Is.Null);
-    }
-
-    [Test]
-    public async Task GetAlbum_returns_null_on_probe_failure()
-    {
-        var fake = new FakeYtDlpRunner
-        {
-            BufferBehavior = (a, ct) => Task.FromResult(new YtDlpRunResult(1, string.Empty, "nope"))
-        };
-        await using var indexer = new YtDlpIndexer(Settings(), fake);
-        Assert.That(await indexer.GetAlbumAsync("yt:abc123"), Is.Null);
-    }
-
-    [Test]
-    public async Task Stream_variants_yield_same_as_list_variants()
-    {
-        var fake = Fake(new[]
-        {
-            Line("abc123", "Song One", "Artist A", 213.5, "video")
+            Artist = new Artist { Name = "Artist A" }
         });
-        await using var indexer = new YtDlpIndexer(Settings(), fake);
 
-        var streamed = new List<StreamingTrack>();
-        await foreach (var t in indexer.SearchTracksStreamAsync("q"))
+        Assert.Multiple(() =>
         {
-            streamed.Add(t);
-        }
+            Assert.That(seenUrl, Does.StartWith("ytsearch"), "artist search → ytsearchN: prefix");
+            Assert.That(seenUrl, Does.EndWith(":Artist A"));
+            Assert.That(releases, Is.Empty);
+        });
+    }
 
-        Assert.That(streamed, Has.Count.EqualTo(1));
-        Assert.That(streamed[0].Id, Is.EqualTo("yt:abc123"));
+    [Test]
+    public async Task Fetch_returns_empty_on_runner_failure_never_throws()
+    {
+        _fake.BufferBehavior = (args, ct) => Task.FromResult(new YtDlpRunResult(1, string.Empty, "boom"));
+
+        var releases = await _indexer.Fetch(new AlbumSearchCriteria
+        {
+            Artist = new Artist { Name = "X" },
+            AlbumTitle = "Y"
+        });
+
+        Assert.That(releases, Is.Empty);
+    }
+
+    [Test]
+    public async Task Fetch_skips_unusable_entries_and_bad_json_lines()
+    {
+        _fake.BufferBehavior = (args, ct) =>
+            Task.FromResult(new YtDlpRunResult(0, string.Join('\n',
+            [
+                "WARNING: something yt-dlp grumbled",
+                "{not json}",
+                Line("vid1", "V", "A", 1, "video"),
+                Line("vid2", "NoUrl", "A", 1, "video", url: null) // url fallback is https watch → usable
+            ]), string.Empty));
+
+        var releases = await _indexer.Fetch(new AlbumSearchCriteria
+        {
+            Artist = new Artist { Name = "X" },
+            AlbumTitle = "Y"
+        });
+
+        // Both vid entries are usable (Line() falls back to a watch URL).
+        Assert.That(releases, Has.Count.EqualTo(2));
+    }
+
+    [Test]
+    public void MapRelease_requires_id_and_https_url()
+    {
+        Assert.That(YtDlpIndexer.MapRelease(new SearchEntry(string.Empty, "https://x", "T", "C", null, "video")), Is.Null);
+        Assert.That(YtDlpIndexer.MapRelease(new SearchEntry("id1", "ftp://x", "T", "C", null, "video")), Is.Null);
+        Assert.That(YtDlpIndexer.MapRelease(new SearchEntry("id1", string.Empty, "T", "C", null, "video")), Is.Null);
+
+        var mapped = YtDlpIndexer.MapRelease(
+            new SearchEntry("id1", "https://www.youtube.com/watch?v=id1", "Solo Song", "", null, "video"),
+            fallbackArtist: "Fallback");
+        Assert.Multiple(() =>
+        {
+            Assert.That(mapped, Is.Not.Null);
+            Assert.That(mapped!.Artist, Is.EqualTo("Fallback"), "blank channel → fallback artist");
+            Assert.That(mapped.Title, Is.EqualTo("Fallback - Solo Song"));
+        });
+    }
+
+    [Test]
+    public void NormalizeQuery_collapses_and_trims_parts()
+    {
+        Assert.Multiple(() =>
+        {
+            Assert.That(YtDlpIndexer.NormalizeQuery("  A  ", "B", null, "", " C "), Is.EqualTo("A B C"));
+            Assert.That(YtDlpIndexer.NormalizeQuery(null, "", "   "), Is.EqualTo(string.Empty));
+        });
     }
 }

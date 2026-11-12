@@ -5,41 +5,51 @@ namespace Lidarr.Plugin.YtDlp.Settings;
 
 /// <summary>
 /// Pure/deterministic settings validation (no filesystem or network access; external
-/// connectivity is checked by the connection tester, Phase 5).
+/// connectivity is checked by the connection tester).
+///
+/// The rules live in <see cref="ApplySharedRules{T}"/> so the provider settings
+/// validators (indexer/client) can apply the same shared rules to their own
+/// concrete settings types and add provider-specific rules on top.
 /// </summary>
-public sealed class YtDlpSettingsValidator : AbstractValidator<YtDlpSettings>
+public class YtDlpSettingsValidator : AbstractValidator<YtDlpSettings>
 {
     public YtDlpSettingsValidator()
     {
-        RuleFor(s => s.YtDlpPath)
+        ApplySharedRules(this);
+    }
+
+    public static void ApplySharedRules<T>(AbstractValidator<T> validator) where T : YtDlpSettings
+    {
+        validator.RuleFor(s => s.YtDlpPath)
             .NotEmpty().WithMessage("Path to yt-dlp is required.")
             .MaximumLength(512).WithMessage("yt-dlp path is too long.");
 
-        RuleFor(s => s.AdditionalArgs)
+        validator.RuleFor(s => s.AdditionalArgs)
             .MaximumLength(1024).WithMessage("Additional arguments are too long.")
             .Must(args => ShellTokenizer.TryParse(args, out _, out _))
             .WithMessage("Additional arguments could not be parsed. Quote values that contain spaces.");
 
-        RuleFor(s => s.MinDownloadDelaySeconds)
+        validator.RuleFor(s => s.MinDownloadDelaySeconds)
             .InclusiveBetween(0, 3600).WithMessage("Minimum delay must be between 0 and 3600 seconds.");
 
-        RuleFor(s => s.MaxDownloadDelaySeconds)
+        validator.RuleFor(s => s.MaxDownloadDelaySeconds)
             .InclusiveBetween(0, 86400).WithMessage("Maximum delay must be between 0 and 86400 seconds.");
 
-        RuleFor(s => s.SearchLimit)
+        validator.RuleFor(s => s.SearchLimit)
             .InclusiveBetween(1, 100).WithMessage("Search limit must be between 1 and 100.");
 
-        RuleFor(s => s.SponsorBlockApiEndpoint)
-            .MaximumLength(512).WithMessage("SponsorBlock endpoint is too long.");
+        // NB: FluentValidation's When() applies to the constraints declared before
+        // it, so the predicate must come last to condition both rules.
+        validator.RuleFor(s => s.SponsorBlockApiEndpoint)
+            .MaximumLength(512).WithMessage("SponsorBlock endpoint is too long.")
+            .Must(IsValidSponsorBlockEndpoint)
+            .WithMessage("SponsorBlock endpoint must be a valid http(s) URL when SponsorBlock is enabled.")
+            .When(s => s.UseSponsorBlock);
 
-        // Cross-field rules.
-        RuleFor(s => s)
+        // Cross-field rule.
+        validator.RuleFor(s => s)
             .Must(s => s.MinDownloadDelaySeconds <= s.MaxDownloadDelaySeconds)
             .WithMessage("Minimum delay must be less than or equal to maximum delay.");
-
-        RuleFor(s => s)
-            .Must(s => !s.UseSponsorBlock || IsValidSponsorBlockEndpoint(s.SponsorBlockApiEndpoint))
-            .WithMessage("SponsorBlock endpoint must be a valid http(s) URL when SponsorBlock is enabled.");
     }
 
     /// <summary>

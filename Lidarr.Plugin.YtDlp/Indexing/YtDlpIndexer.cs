@@ -1,204 +1,160 @@
-using System.Runtime.CompilerServices;
-using System.Text.Json;
-using Lidarr.Plugin.Abstractions.Contracts;
-using Lidarr.Plugin.Abstractions.Models;
+using FluentValidation.Results;
+using NLog;
+using NzbDrone.Common.Http;
+using NzbDrone.Core.Configuration;
+using NzbDrone.Core.IndexerSearch.Definitions;
+using NzbDrone.Core.Indexers;
+using NzbDrone.Core.Parser;
+using NzbDrone.Core.Parser.Model;
+using NzbDrone.Core.ThingiProvider;
 using Lidarr.Plugin.YtDlp.Commands;
 using Lidarr.Plugin.YtDlp.Download;
+using Lidarr.Plugin.YtDlp.Probing;
 using Lidarr.Plugin.YtDlp.Runner;
 using Lidarr.Plugin.YtDlp.Settings;
-using Microsoft.Extensions.Logging;
 
 namespace Lidarr.Plugin.YtDlp.Indexing;
 
 /// <summary>
-/// Lidarr <see cref="IIndexer"/> (and <see cref="IIndexerWithMetadata"/>) over
-/// yt-dlp. Deliberately does NOT derive from <c>BaseStreamingIndexer</c> — that
-/// base is HTTP-API-shaped (HttpClient + JSON APIs); this indexer is
-/// process-driven. We borrow only the base's query pre/post-processing ideas
-/// (trim/normalize the query, dedupe + cap results) and keep every behavior
-/// unit-testable behind <see cref="IYtDlpRunner"/>.
+/// Native host <see cref="IIndexer"/> over yt-dlp (process-driven, NOT an HTTP
+/// API indexer).
 ///
-/// All search calls are serialized through one semaphore (rate-limit courtesy)
-/// and capped at <see cref="YtDlpSettings.SearchLimit"/>. Search failures never
-/// throw to the host — they return an empty list.
+/// Search:
+///  - Album search  → YouTube Music album search ("&lt;artist&gt; &lt;album&gt;").
+///  - Artist search → generic YouTube search ("&lt;artist&gt;").
+///  - Recent/RSS    → empty (YouTube has no music release feed).
 ///
-/// Album-id tokens emitted here are the Phase 3 download contract:
-///   <c>yt:&lt;videoId&gt;</c> (single-track album) / <c>playlist:&lt;id&gt;</c>.
+/// Every result is shaped for the host decision engine:
+///  - <c>Title</c> is composed as "<c>Channel - Title</c>" so the host parser
+///    (ParseAlbumTitleWithSearchCriteria: ^artist...album$) can match it.
+///  - <c>Guid</c> is the stable video/playlist id (dedupe + grab identity).
+///  - <c>DownloadUrl</c> is the real YouTube watch/playlist URL; the download
+///    client parses it back to a yt-dlp target via <see cref="YtDlpAlbumId.TryFromUrl"/>.
+///  - <c>Size</c> = 0 (unknown) → the host skips its size specifications.
+///  - <c>PublishDate</c> = DateTime.MinValue (unknown; no spec in the search
+///    decision path rejects an old publish date).
+///
+/// Search failures never throw to the host — they return an empty list.
 /// </summary>
-public sealed class YtDlpIndexer : IIndexer, IIndexerWithMetadata, IAsyncDisposable
+public class YtDlpIndexer : IndexerBase<YtDlpIndexerSettings>
 {
-    public const string ProtocolId = "ytdlp";
-    public const string TracksMetadataKey = "ytdlp.tracks";
+    /// <summary>Bounded timeout for the settings Test() connection check.</summary>
+    private static readonly TimeSpan TestTimeout = TimeSpan.FromSeconds(90);
 
-    private readonly YtDlpSettings _settings;
-    private readonly IYtDlpRunner _runner;
     private readonly YtDlpCommandBuilder _builder = new();
     private readonly SemaphoreSlim _searchGate = new(1, 1);
-    private readonly ILogger? _logger;
 
-    public YtDlpIndexer(YtDlpSettings settings, IYtDlpRunner runner, ILogger? logger = null)
+    public YtDlpIndexer(
+        IIndexerStatusService indexerStatusService,
+        IConfigService configService,
+        IParsingService parsingService,
+        Logger logger)
+        : base(indexerStatusService, configService, parsingService, logger)
     {
-        _settings = settings ?? throw new ArgumentNullException(nameof(settings));
-        _runner = runner ?? throw new ArgumentNullException(nameof(runner));
-        _logger = logger;
     }
 
-    // ----- IIndexerWithMetadata -----
+    public override string Name => "YouTube (yt-dlp)";
 
-    public string Protocol => ProtocolId;
-    public int PageSize { get; } = 25;
-    public int MaxPageSize { get; } = 25;
-    public bool SupportsRss => false;
-    public string ServiceName => "YouTube (yt-dlp)";
+    public override string Protocol => nameof(YtDlpDownloadProtocol);
 
-    // ----- IIndexer -----
+    public override bool SupportsRss => false;
 
-    public ValueTask<PluginValidationResult> InitializeAsync(CancellationToken cancellationToken = default)
+    public override bool SupportsSearch => true;
+
+    /// <summary>
+    /// "Add indexer" template. Name = null makes ProviderFactory.GetDefaultDefinitions
+    /// pick this definition (it matches the v.Name == null branch) instead of the
+    /// base-class one, which would compute the search flags from Validate() on
+    /// empty settings (no yt-dlp path yet) and leave interactive search off.
+    /// </summary>
+    public override IEnumerable<ProviderDefinition> DefaultDefinitions
     {
-        // Structural check only; full external verification (yt-dlp --version,
-        // reachability) is the Phase 5 connection test.
-        if (string.IsNullOrWhiteSpace(_settings.YtDlpPath))
+        get
         {
-            return ValueTask.FromResult(
-                PluginValidationResult.Failure(new[] { "ytDlpPath is not configured." }));
-        }
-
-        return ValueTask.FromResult(PluginValidationResult.Success());
-    }
-
-    public async ValueTask<IReadOnlyList<StreamingAlbum>> SearchAlbumsAsync(string query, CancellationToken cancellationToken = default)
-    {
-        if (string.IsNullOrWhiteSpace(query))
-        {
-            return Array.Empty<StreamingAlbum>();
-        }
-
-        var entries = await SearchAsync(_builder.BuildAlbumSearchArgs(NormalizeQuery(query), _limit), cancellationToken)
-            .ConfigureAwait(false);
-
-        var results = new List<StreamingAlbum>(entries.Count);
-        var seen = new HashSet<string>(StringComparer.Ordinal);
-
-        foreach (var entry in entries)
-        {
-            var album = MapAlbum(entry);
-            if (album != null && seen.Add(album.Id!))
+            yield return new IndexerDefinition
             {
-                results.Add(album);
-            }
+                Name = null,
+                EnableRss = false,
+                EnableAutomaticSearch = false,
+                EnableInteractiveSearch = true,
+                Implementation = GetType().Name,
+                Settings = new YtDlpIndexerSettings(),
+                Protocol = Protocol,
+                SupportsRss = SupportsRss,
+                SupportsSearch = SupportsSearch
+            };
         }
-
-        return results;
     }
 
-    public async ValueTask<IReadOnlyList<StreamingTrack>> SearchTracksAsync(string query, CancellationToken cancellationToken = default)
+    public override Task<IList<ReleaseInfo>> FetchRecent()
     {
-        if (string.IsNullOrWhiteSpace(query))
-        {
-            return Array.Empty<StreamingTrack>();
-        }
-
-        var entries = await SearchAsync(_builder.BuildSearchArgs(NormalizeQuery(query), _limit), cancellationToken)
-            .ConfigureAwait(false);
-
-        var results = new List<StreamingTrack>(entries.Count);
-        var seen = new HashSet<string>(StringComparer.Ordinal);
-
-        foreach (var entry in entries)
-        {
-            var track = MapTrack(entry, trackNumber: null);
-            if (track != null && seen.Add(track.Id!))
-            {
-                results.Add(track);
-            }
-        }
-
-        return results;
+        // YouTube has no useful "recent releases" feed for a music library.
+        return Task.FromResult<IList<ReleaseInfo>>(new ReleaseInfo[0]);
     }
 
-    public async ValueTask<StreamingAlbum?> GetAlbumAsync(string albumId, CancellationToken cancellationToken = default)
+    public override Task<IList<ReleaseInfo>> Fetch(AlbumSearchCriteria searchCriteria)
     {
-        if (!YtDlpAlbumId.TryParse(albumId, out var album))
+        var query = NormalizeQuery(searchCriteria.ArtistQuery, searchCriteria.AlbumTitle, searchCriteria.Disambiguation);
+        if (query.Length == 0)
         {
-            return null;
+            return Task.FromResult<IList<ReleaseInfo>>(new ReleaseInfo[0]);
         }
 
-        var url = YtDlpAlbumId.ToUrl(album);
-        var args = album.Kind == YtDlpAlbumKind.SingleTrack
-            ? _builder.BuildProbeArgs(url)
-            : _builder.BuildPlaylistProbeArgs(url);
+        return FetchReleasesAsync(_builder.BuildAlbumSearchArgs(query, Limit), searchCriteria.Artist.Name);
+    }
 
+    public override Task<IList<ReleaseInfo>> Fetch(ArtistSearchCriteria searchCriteria)
+    {
+        var query = NormalizeQuery(searchCriteria.ArtistQuery);
+        if (query.Length == 0)
+        {
+            return Task.FromResult<IList<ReleaseInfo>>(new ReleaseInfo[0]);
+        }
+
+        return FetchReleasesAsync(_builder.BuildSearchArgs(query, Limit), searchCriteria.Artist.Name);
+    }
+
+    public override HttpRequest GetDownloadRequest(string link) => new(link);
+
+    protected override async Task Test(List<ValidationFailure> failures)
+    {
+        using var cts = new CancellationTokenSource(TestTimeout);
         try
         {
-            await _searchGate.WaitAsync(cancellationToken).ConfigureAwait(false);
-            try
+            var result = await YtDlpConnectionTest.RunAsync(Settings, cts.Token).ConfigureAwait(false);
+            foreach (var error in result.Errors)
             {
-                var result = await _runner.RunBufferedAsync(args, cancellationToken).ConfigureAwait(false);
-                if (!result.IsSuccess || string.IsNullOrWhiteSpace(result.StandardOutput))
-                {
-                    _logger?.LogWarning("GetAlbumAsync probe for {AlbumId} failed (exit {ExitCode}): {StdErr}",
-                        albumId, result.ExitCode, Truncate(result.StandardError, 300));
-                    return null;
-                }
-
-                return album.Kind == YtDlpAlbumKind.SingleTrack
-                    ? MapSingleTrackAlbum(result.StandardOutput)
-                    : MapPlaylistAlbum(result.StandardOutput, album);
+                failures.Add(new ValidationFailure(error.Property, error.Message));
             }
-            finally
+
+            foreach (var warning in result.Warnings)
             {
-                _searchGate.Release();
+                _logger.Warn("[{0}] {1}", Name, warning);
             }
         }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        catch (OperationCanceledException)
         {
-            throw;
+            failures.Add(new ValidationFailure("YtDlpPath", "Connection test timed out."));
         }
         catch (Exception ex)
         {
-            _logger?.LogWarning(ex, "GetAlbumAsync failed for {AlbumId}", albumId);
-            return null;
+            _logger.Error(ex, "[{0}] Connection test failed", Name);
+            failures.Add(new ValidationFailure(string.Empty, "Connection test failed: " + ex.Message));
         }
     }
 
-    public async IAsyncEnumerable<StreamingAlbum> SearchAlbumsStreamAsync(
-        string query,
-        [EnumeratorCancellation] CancellationToken cancellationToken = default)
-    {
-        foreach (var album in await SearchAlbumsAsync(query, cancellationToken).ConfigureAwait(false))
-        {
-            yield return album;
-        }
-    }
+    private int Limit => Math.Clamp(Settings.SearchLimit, 1, 100);
 
-    public async IAsyncEnumerable<StreamingTrack> SearchTracksStreamAsync(
-        string query,
-        [EnumeratorCancellation] CancellationToken cancellationToken = default)
-    {
-        foreach (var track in await SearchTracksAsync(query, cancellationToken).ConfigureAwait(false))
-        {
-            yield return track;
-        }
-    }
-
-    public ValueTask DisposeAsync()
-    {
-        _searchGate.Dispose();
-        return ValueTask.CompletedTask;
-    }
-
-    // ----- internals -----
-
-    private int _limit => Math.Clamp(_settings.SearchLimit, 1, 100);
-
-    /// <summary>Runs one buffered yt-dlp search; failures → empty list (search never throws).</summary>
-    private async Task<IReadOnlyList<SearchEntry>> SearchAsync(IReadOnlyList<string> args, CancellationToken ct)
+    /// <summary>Runs one serialized yt-dlp search; failures → empty list (search never throws).</summary>
+    private async Task<IList<ReleaseInfo>> FetchReleasesAsync(IReadOnlyList<string> args, string? fallbackArtist)
     {
         YtDlpRunResult result;
-        await _searchGate.WaitAsync(ct).ConfigureAwait(false);
+        await _searchGate.WaitAsync().ConfigureAwait(false);
         try
         {
-            result = await _runner.RunBufferedAsync(args, ct).ConfigureAwait(false);
+            result = await YtDlpRunners.For(Settings.YtDlpPath)
+                .RunBufferedAsync(args, CancellationToken.None)
+                .ConfigureAwait(false);
         }
         finally
         {
@@ -207,259 +163,60 @@ public sealed class YtDlpIndexer : IIndexer, IIndexerWithMetadata, IAsyncDisposa
 
         if (!result.IsSuccess)
         {
-            _logger?.LogWarning("yt-dlp search failed (exit {ExitCode}): {StdErr}",
-                result.ExitCode, Truncate(result.StandardError, 300));
-            return Array.Empty<SearchEntry>();
+            _logger.Warn("[{0}] yt-dlp search failed (exit {1}): {2}", Name, result.ExitCode, Truncate(result.StandardError, 300));
+            return new ReleaseInfo[0];
         }
 
-        var entries = SearchLineParser.ParseAll(result.StandardOutput);
-        return entries.Count > _limit ? entries.Take(_limit).ToList() : entries;
-    }
+        var releases = SearchLineParser.ParseAll(result.StandardOutput)
+            .Take(Limit)
+            .Select(entry => MapRelease(entry, fallbackArtist))
+            .Where(r => r != null)
+            .ToList();
 
-    internal static StreamingAlbum? MapAlbum(SearchEntry entry)
-    {
-        if (string.IsNullOrEmpty(entry.Id))
-        {
-            return null;
-        }
-
-        var isPlaylist = string.Equals(entry.Type, "playlist", StringComparison.OrdinalIgnoreCase)
-                         || entry.Url.Contains("list=", StringComparison.Ordinal);
-
-        if (!isPlaylist && !entry.Url.StartsWith("https://", StringComparison.Ordinal))
-        {
-            // No usable form for this entry — skip.
-            return null;
-        }
-
-        var artist = new StreamingArtist
-        {
-            Id = string.Empty,
-            Name = string.IsNullOrWhiteSpace(entry.Channel) ? "Unknown Artist" : entry.Channel
-        };
-
-        if (isPlaylist)
-        {
-            return new StreamingAlbum
-            {
-                Id = $"playlist:{entry.Id}",
-                Title = entry.Title,
-                Artist = artist,
-                Type = StreamingAlbumType.Album,
-                TrackCount = 0, // unknown until GetAlbumAsync expands it
-                Metadata =
-                {
-                    ["url"] = entry.Url
-                }
-            };
-        }
-
-        // A plain video entry is a single-track "album".
-        return new StreamingAlbum
-        {
-            Id = $"yt:{entry.Id}",
-            Title = entry.Title,
-            Artist = artist,
-            Type = StreamingAlbumType.Single,
-            TrackCount = 1,
-            Duration = entry.Duration != null ? TimeSpan.FromSeconds(entry.Duration.Value) : null,
-            Metadata =
-            {
-                ["url"] = entry.Url
-            }
-        };
-    }
-
-    internal static StreamingTrack? MapTrack(SearchEntry entry, int? trackNumber)
-    {
-        if (string.IsNullOrEmpty(entry.Id))
-        {
-            return null;
-        }
-
-        return new StreamingTrack
-        {
-            Id = $"yt:{entry.Id}",
-            Title = entry.Title,
-            Artist = new StreamingArtist
-            {
-                Id = string.Empty,
-                Name = string.IsNullOrWhiteSpace(entry.Channel) ? "Unknown Artist" : entry.Channel
-            },
-            TrackNumber = trackNumber,
-            Duration = entry.Duration != null ? TimeSpan.FromSeconds(entry.Duration.Value) : null,
-            Album = new StreamingAlbum
-            {
-                Id = $"yt:{entry.Id}",
-                Title = entry.Title,
-                TrackCount = 1
-            },
-            Metadata =
-            {
-                ["url"] = entry.Url,
-                ["type"] = entry.Type ?? string.Empty
-            }
-        };
-    }
-
-    /// <summary>Single-video probe JSON → one-track album with the track attached.</summary>
-    private StreamingAlbum? MapSingleTrackAlbum(string json)
-    {
-        using var doc = JsonDocument.Parse(json);
-        var root = doc.RootElement;
-
-        var title = GetString(root, "title");
-        if (string.IsNullOrWhiteSpace(title))
-        {
-            return null;
-        }
-
-        var channel = GetString(root, "channel");
-        if (string.IsNullOrWhiteSpace(channel))
-        {
-            channel = GetString(root, "uploader");
-        }
-
-        TimeSpan? duration = null;
-        if (root.TryGetProperty("duration", out var d) && d.ValueKind == JsonValueKind.Number)
-        {
-            duration = TimeSpan.FromSeconds(d.GetDouble());
-        }
-
-        var id = GetString(root, "id");
-        var url = GetString(root, "webpage_url");
-        if (string.IsNullOrEmpty(url))
-        {
-            url = GetString(root, "url");
-        }
-
-        var track = new StreamingTrack
-        {
-            Id = string.IsNullOrEmpty(id) ? string.Empty : $"yt:{id}",
-            Title = title,
-            Artist = new StreamingArtist
-            {
-                Id = string.Empty,
-                Name = string.IsNullOrWhiteSpace(channel) ? "Unknown Artist" : channel
-            },
-            TrackNumber = 1,
-            Duration = duration,
-            Metadata =
-            {
-                ["url"] = url
-            }
-        };
-
-        return new StreamingAlbum
-        {
-            Id = string.IsNullOrEmpty(id) ? string.Empty : $"yt:{id}",
-            Title = title,
-            Artist = track.Artist,
-            Type = StreamingAlbumType.Single,
-            TrackCount = 1,
-            Duration = duration,
-            Metadata =
-            {
-                ["url"] = url,
-                [TracksMetadataKey] = new List<StreamingTrack> { track }
-            }
-        };
+        return CleanupReleases(releases);
     }
 
     /// <summary>
-    /// Flat playlist probe JSON → album shell (title/artist/track count) with the
-    /// expanded track list in Metadata[TracksMetadataKey]. Flat entries lack per-track
-    /// channels, so track artist falls back to the playlist owner.
+    /// Maps one yt-dlp search entry to a host <see cref="ReleaseInfo"/>.
+    /// Internal + static so the mapping (the decision-engine contract) is unit-testable.
     /// </summary>
-    private StreamingAlbum? MapPlaylistAlbum(string json, YtDlpAlbumRef album)
+    internal static ReleaseInfo? MapRelease(SearchEntry entry, string? fallbackArtist = null)
     {
-        using var doc = JsonDocument.Parse(json);
-        var root = doc.RootElement;
-
-        var title = GetString(root, "title");
-        var owner = GetString(root, "channel");
-        if (string.IsNullOrWhiteSpace(owner))
-        {
-            owner = GetString(root, "uploader");
-        }
-
-        var tracks = new List<StreamingTrack>();
-        if (root.TryGetProperty("playlist", out var entries) && entries.ValueKind == JsonValueKind.Array)
-        {
-            var number = 0;
-            foreach (var el in entries.EnumerateArray())
-            {
-                if (el.ValueKind != JsonValueKind.Object)
-                {
-                    continue;
-                }
-
-                var id = GetString(el, "id");
-                if (string.IsNullOrEmpty(id))
-                {
-                    continue;
-                }
-
-                number++;
-                var t = new StreamingTrack
-                {
-                    Id = $"yt:{id}",
-                    Title = GetString(el, "title"),
-                    Artist = new StreamingArtist
-                    {
-                        Id = string.Empty,
-                        Name = string.IsNullOrWhiteSpace(owner) ? "Unknown Artist" : owner
-                    },
-                    TrackNumber = number,
-                    Duration = el.TryGetProperty("duration", out var d) && d.ValueKind == JsonValueKind.Number
-                        ? TimeSpan.FromSeconds(d.GetDouble())
-                        : null,
-                    Metadata =
-                    {
-                        ["url"] = GetString(el, "url")
-                    }
-                };
-                tracks.Add(t);
-            }
-        }
-
-        if (tracks.Count == 0)
+        if (string.IsNullOrEmpty(entry.Id) || string.IsNullOrWhiteSpace(entry.Url))
         {
             return null;
         }
 
-        return new StreamingAlbum
+        if (!entry.Url.StartsWith("https://", StringComparison.Ordinal))
         {
-            Id = album.ToString(),
-            Title = string.IsNullOrWhiteSpace(title) ? $"Playlist {album.Id}" : title,
-            Artist = new StreamingArtist
-            {
-                Id = string.Empty,
-                Name = string.IsNullOrWhiteSpace(owner) ? "Unknown Artist" : owner
-            },
-            Type = StreamingAlbumType.Album,
-            TrackCount = tracks.Count,
-            Metadata =
-            {
-                [TracksMetadataKey] = tracks
-            }
+            // No usable form for this entry.
+            return null;
+        }
+
+        var artist = string.IsNullOrWhiteSpace(entry.Channel)
+            ? (fallbackArtist ?? "Unknown Artist")
+            : entry.Channel;
+
+        return new ReleaseInfo
+        {
+            Guid = entry.Id,
+            Title = $"{artist} - {entry.Title}",
+            Artist = artist,
+            Album = entry.Title,
+            DownloadUrl = entry.Url,
+            InfoUrl = entry.Url,
+            PublishDate = DateTime.MinValue,
+            Size = 0
         };
     }
 
-    private static string NormalizeQuery(string query)
+    internal static string NormalizeQuery(params string?[] parts)
     {
-        if (string.IsNullOrWhiteSpace(query))
-        {
-            return string.Empty;
-        }
-
-        return System.Text.RegularExpressions.Regex.Replace(query.Trim(), @"\s+", " ");
+        var joined = string.Join(" ", parts
+            .Where(p => !string.IsNullOrWhiteSpace(p))
+            .Select(p => p!.Trim()));
+        return System.Text.RegularExpressions.Regex.Replace(joined, @"\s+", " ").Trim();
     }
-
-    private static string GetString(JsonElement root, string name) =>
-        root.TryGetProperty(name, out var el) && el.ValueKind == JsonValueKind.String
-            ? el.GetString() ?? string.Empty
-            : string.Empty;
 
     private static string Truncate(string s, int max) =>
         string.IsNullOrEmpty(s) || s.Length <= max ? s : s[^max..];

@@ -23,8 +23,17 @@
     <ProjectReference Include="..\Lidarr.Plugin.YtDlp\Lidarr.Plugin.YtDlp.csproj" />
   </ItemGroup>
 
+  <!--
+    Direct host references: the plugin project uses DisableTransitiveProjectReferences
+    (so host DLLs never leak into the plugin output), which also blocks the transitive
+    flow here. The test host needs the assemblies at RUNTIME (type-load smoke tests
+    instantiate the plugin providers against them), so reference them directly and let
+    them copy into the test output.
+  -->
   <ItemGroup>
-    <None Include="..\plugin.json" Link="plugin.json" CopyToOutputDirectory="PreserveNewest" />
+    <ProjectReference Include="..\ext\Lidarr\src\NzbDrone.Common\Lidarr.Common.csproj" />
+    <ProjectReference Include="..\ext\Lidarr\src\NzbDrone.Core\Lidarr.Core.csproj" />
+    <ProjectReference Include="..\ext\Lidarr\src\Lidarr.Http\Lidarr.Http.csproj" />
   </ItemGroup>
 
   <ItemGroup>

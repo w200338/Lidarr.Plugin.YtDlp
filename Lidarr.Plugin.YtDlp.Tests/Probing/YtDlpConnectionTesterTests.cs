@@ -1,7 +1,7 @@
-using Lidarr.Plugin.Abstractions.Contracts;
 using Lidarr.Plugin.YtDlp.Probing;
 using Lidarr.Plugin.YtDlp.Settings;
 using Lidarr.Plugin.YtDlp.SponsorBlock;
+using NUnit.Framework;
 
 namespace Lidarr.Plugin.YtDlp.Tests.Probing;
 
@@ -56,6 +56,12 @@ internal sealed class FakeSbClient : ISponsorBlockClient
         Task.FromResult<IReadOnlyList<SponsorBlockSegment>>(Array.Empty<SponsorBlockSegment>());
 }
 
+/// <summary>
+/// Phase 7 (native model): the tester now returns the host-agnostic
+/// <see cref="ConnectionTestResult"/> (the old Abstractions
+/// PluginValidationResult is gone); provider Test() methods map it into
+/// host validation failures.
+/// </summary>
 public class YtDlpConnectionTesterTests
 {
     private static (YtDlpConnectionTester Tester, FakeProbe Probe, FakeSbClient Sb) Build(
@@ -82,11 +88,14 @@ public class YtDlpConnectionTesterTests
 
         var result = await tester.TestAsync(Settings());
 
-        Assert.That(result.IsValid, Is.True);
-        Assert.That(result.Warnings, Is.Empty);
-        Assert.That(probe.YtDlpCalls, Is.EqualTo(1));
-        Assert.That(probe.FfmpegCalls, Is.EqualTo(0), "no reencode and no SponsorBlock → ffmpeg not needed");
-        Assert.That(sb.Calls, Is.EqualTo(0));
+        Assert.Multiple(() =>
+        {
+            Assert.That(result.Success, Is.True);
+            Assert.That(result.Warnings, Is.Empty);
+            Assert.That(probe.YtDlpCalls, Is.EqualTo(1));
+            Assert.That(probe.FfmpegCalls, Is.EqualTo(0), "no reencode and no SponsorBlock → ffmpeg not needed");
+            Assert.That(sb.Calls, Is.EqualTo(0));
+        });
     }
 
     [Test]
@@ -106,8 +115,11 @@ public class YtDlpConnectionTesterTests
 
         _ = await tester.TestAsync(Settings(sponsorBlock: true));
 
-        Assert.That(probe.FfmpegCalls, Is.EqualTo(1));
-        Assert.That(sb.Calls, Is.EqualTo(1));
+        Assert.Multiple(() =>
+        {
+            Assert.That(probe.FfmpegCalls, Is.EqualTo(1));
+            Assert.That(sb.Calls, Is.EqualTo(1));
+        });
     }
 
     [Test]
@@ -118,11 +130,15 @@ public class YtDlpConnectionTesterTests
 
         var result = await tester.TestAsync(Settings(reencode: ReencodeFormat.Opus, sponsorBlock: true));
 
-        Assert.That(result.IsValid, Is.False);
-        Assert.That(result.Errors, Has.Count.EqualTo(1));
-        Assert.That(result.Errors[0], Does.Contain("yt-dlp not found"));
-        Assert.That(probe.FfmpegCalls, Is.EqualTo(0), "dependent checks skipped after binary failure");
-        Assert.That(sb.Calls, Is.EqualTo(0));
+        Assert.Multiple(() =>
+        {
+            Assert.That(result.Success, Is.False);
+            Assert.That(result.Errors, Has.Count.EqualTo(1));
+            Assert.That(result.Errors[0].Property, Is.EqualTo("YtDlpPath"));
+            Assert.That(result.Errors[0].Message, Does.Contain("yt-dlp not found"));
+            Assert.That(probe.FfmpegCalls, Is.EqualTo(0), "dependent checks skipped after binary failure");
+            Assert.That(sb.Calls, Is.EqualTo(0));
+        });
     }
 
     [Test]
@@ -133,9 +149,12 @@ public class YtDlpConnectionTesterTests
 
         var result = await tester.TestAsync(Settings(reencode: ReencodeFormat.Aac));
 
-        Assert.That(result.IsValid, Is.False);
-        Assert.That(result.Errors, Has.Count.EqualTo(1));
-        Assert.That(result.Errors[0], Does.Contain("ffmpeg"));
+        Assert.Multiple(() =>
+        {
+            Assert.That(result.Success, Is.False);
+            Assert.That(result.Errors, Has.Count.EqualTo(1));
+            Assert.That(result.Errors[0].Message, Does.Contain("ffmpeg"));
+        });
     }
 
     [Test]
@@ -146,8 +165,7 @@ public class YtDlpConnectionTesterTests
 
         var result = await tester.TestAsync(Settings(sponsorBlock: true));
 
-        Assert.That(result.IsValid, Is.False);
-        Assert.That(result.Errors[0], Does.Contain("SponsorBlock"));
+        Assert.That(result.Errors[0].Message, Does.Contain("SponsorBlock"));
     }
 
     [Test]
@@ -159,8 +177,11 @@ public class YtDlpConnectionTesterTests
 
         var result = await tester.TestAsync(Settings(reencode: ReencodeFormat.Opus, sponsorBlock: true));
 
-        Assert.That(result.IsValid, Is.False);
-        Assert.That(result.Errors, Has.Count.EqualTo(2));
+        Assert.Multiple(() =>
+        {
+            Assert.That(result.Success, Is.False);
+            Assert.That(result.Errors, Has.Count.EqualTo(2));
+        });
     }
 
     [Test]
@@ -171,10 +192,13 @@ public class YtDlpConnectionTesterTests
 
         var result = await tester.TestAsync(Settings(), probeUrl: "https://www.youtube.com/watch?v=abc123");
 
-        Assert.That(result.IsValid, Is.True);
-        Assert.That(result.Warnings, Has.Count.EqualTo(1));
-        Assert.That(result.Warnings[0], Does.Contain("timed out"));
-        Assert.That(probe.VideoCalls, Is.EqualTo(1));
+        Assert.Multiple(() =>
+        {
+            Assert.That(result.Success, Is.True);
+            Assert.That(result.Warnings, Has.Count.EqualTo(1));
+            Assert.That(result.Warnings[0], Does.Contain("timed out"));
+            Assert.That(probe.VideoCalls, Is.EqualTo(1));
+        });
     }
 
     [Test]
@@ -185,8 +209,7 @@ public class YtDlpConnectionTesterTests
 
         var result = await tester.TestAsync(Settings(), probeUrl: "https://www.youtube.com/watch?v=abc123");
 
-        Assert.That(result.IsValid, Is.False);
-        Assert.That(result.Errors[0], Does.Contain("bot check"));
+        Assert.That(result.Errors[0].Message, Does.Contain("bot check"));
     }
 
     [Test]

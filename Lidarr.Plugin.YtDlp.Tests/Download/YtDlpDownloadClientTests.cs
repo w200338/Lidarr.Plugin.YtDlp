@@ -1,58 +1,119 @@
-using Lidarr.Plugin.Abstractions.Models;
+using System.Globalization;
 using Lidarr.Plugin.YtDlp.Download;
+using Lidarr.Plugin.YtDlp.Probing;
+using Lidarr.Plugin.YtDlp.Runner;
 using Lidarr.Plugin.YtDlp.Settings;
 using Lidarr.Plugin.YtDlp.Tests.Support;
+using NLog;
+using NSubstitute;
+using NzbDrone.Common.Disk;
+using NzbDrone.Core.Configuration;
+using NzbDrone.Core.Download;
+using NzbDrone.Core.Exceptions;
+using NzbDrone.Core.Indexers;
+using NzbDrone.Core.Localization;
+using NzbDrone.Core.Music;
+using NzbDrone.Core.Parser.Model;
+using NzbDrone.Core.RemotePathMappings;
 using NUnit.Framework;
-using YtDlpRunResult = Lidarr.Plugin.YtDlp.Runner.YtDlpRunResult;
 
 namespace Lidarr.Plugin.YtDlp.Tests.Download;
 
-[TestFixture]
+/// <summary>
+/// Phase 7 (native model): YtDlpDownloadClient derives from the host
+/// DownloadClientBase&lt;YtDlpClientSettings&gt;. The host contract (DownloadId
+/// stability, item mapping, removal, import marking) is what gets pinned here.
+/// </summary>
 public class YtDlpDownloadClientTests
 {
-    private string _outputDir = null!;
+    private const string WatchUrl = "https://www.youtube.com/watch?v=abc123";
+
+    private YtDlpDownloadClient _client = null!;
+    private FakeYtDlpRunner _fake = null!;
+    private string _root = null!;
+    private IDiskProvider _diskProvider = null!;
+    private Func<string, IYtDlpRunner>? _previousFactory;
 
     [SetUp]
     public void SetUp()
     {
-        _outputDir = Path.Combine(Path.GetTempPath(), $"ytdlp-client-{Guid.NewGuid():N}");
+        _root = Path.Combine(Path.GetTempPath(), "ytdlp-client-tests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(_root);
+
+        _fake = new FakeYtDlpRunner
+        {
+            // Metadata probe succeeds so the downloader proceeds straight to streaming.
+            BufferBehavior = (args, ct) => Task.FromResult(new YtDlpRunResult(0,
+                "{\"title\":\"Song\",\"channel\":\"Artist A\",\"duration\":120}", string.Empty))
+        };
+        // Streaming: one completed file.
+        _fake.StreamLines.Enqueue((null, "[download] Destination: /tmp/Song.m4a"));
+        _fake.StreamLines.Enqueue((null, "[download] 100.0% of 10.00KiB at 10.00KiB/s"));
+
+        _previousFactory = YtDlpRunners.Factory;
+        YtDlpRunners.Factory = _ => _fake;
+
+        var settings = new YtDlpClientSettings
+        {
+            YtDlpPath = "yt-dlp",
+            DownloadPath = _root,
+            MinDownloadDelaySeconds = 0,
+            MaxDownloadDelaySeconds = 0
+        };
+
+        _diskProvider = Substitute.For<IDiskProvider>();
+
+        _client = new YtDlpDownloadClient(
+            Substitute.For<IConfigService>(),
+            _diskProvider,
+            Substitute.For<IRemotePathMappingService>(),
+            Substitute.For<ILocalizationService>(),
+            LogManager.GetLogger("test"));
+
+        _client.Definition = new DownloadClientDefinition
+        {
+            Id = 3,
+            Name = "TestClient",
+            Settings = settings
+        };
     }
 
     [TearDown]
     public void TearDown()
     {
-        try { Directory.Delete(_outputDir, recursive: true); } catch { /* best effort */ }
+        YtDlpRunners.Factory = _previousFactory!;
+        YtDlpRunners.ClearCache();
+        YtDlpConnectionTest.Override = null;
+        try
+        {
+            Directory.Delete(_root, recursive: true);
+        }
+        catch (IOException)
+        {
+        }
     }
 
-    private static YtDlpSettings NoDelaySettings() => new()
+    private static RemoteAlbum RemoteAlbum() => new()
     {
-        YtDlpPath = "yt-dlp",
-        MinDownloadDelaySeconds = 0,
-        MaxDownloadDelaySeconds = 0
+        Release = new ReleaseInfo
+        {
+            Title = "Artist A - Song",
+            Artist = "Artist A",
+            Album = "Song",
+            DownloadUrl = WatchUrl
+        },
+        Artist = new Artist { Name = "Artist A" },
+        Albums = new List<Album> { new() { Title = "Song" } }
     };
 
-    private static FakeYtDlpRunner SuccessfulFake()
+    private static async Task<DownloadClientItem> WaitFor(
+        YtDlpDownloadClient client, string id, DownloadItemStatus? expectedStatus = null, int timeoutMs = 15000)
     {
-        var fake = new FakeYtDlpRunner
+        var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+        while (DateTime.UtcNow < deadline)
         {
-            BufferBehavior = (args, ct) => Task.FromResult(new YtDlpRunResult(0,
-                """{"title": "Album", "channel": "Artist", "playlist_count": 1}""", string.Empty)),
-            StreamExitCode = 0
-        };
-        fake.StreamLines.Enqueue((null, "[download] Destination: /x/Song.mp3"));
-        fake.StreamLines.Enqueue((null, "[download] 100% of  1.00MiB in 00:01"));
-        return fake;
-    }
-
-    private static async Task<StreamingDownloadItem> WaitForTerminalAsync(YtDlpDownloadClient client, string id, TimeSpan timeout = default)
-    {
-        var sw = System.Diagnostics.Stopwatch.StartNew();
-        timeout = timeout == default ? TimeSpan.FromSeconds(10) : timeout;
-
-        while (sw.Elapsed < timeout)
-        {
-            var item = await client.GetDownloadAsync(id);
-            if (item != null && item.IsCompleted)
+            var item = client.GetItems().FirstOrDefault(i => i.DownloadId == id);
+            if (item != null && (expectedStatus == null || item.Status == expectedStatus))
             {
                 return item;
             }
@@ -60,170 +121,217 @@ public class YtDlpDownloadClientTests
             await Task.Delay(25);
         }
 
-        Assert.Fail("download did not reach terminal state in time");
-        return null!;
+        throw new TimeoutException($"item {id} never reached {expectedStatus?.ToString() ?? "any"} status; last=" +
+            string.Join("|", client.GetItems().Select(i => $"{i.DownloadId}:{i.Status}:{i.Message}")));
     }
 
+    // ----- Download / GetItems -----
+
     [Test]
-    public async Task Enqueue_runs_to_completion_and_reports_result()
+    public async Task Download_returns_stable_id_and_completes_with_host_parseable_title()
     {
-        var fake = SuccessfulFake();
-        await using var client = new YtDlpDownloadClient(NoDelaySettings(), fake);
+        var id = await _client.Download(RemoteAlbum(), Substitute.For<IIndexer>());
 
-        var init = await client.InitializeAsync();
-        var id = await client.EnqueueAlbumDownloadAsync("yt:abc123", _outputDir);
+        Assert.That(!string.IsNullOrEmpty(id), Is.True, "download id must be a non-empty stable string");
 
+        var item = await WaitFor(_client, id, DownloadItemStatus.Completed);
         Assert.Multiple(() =>
         {
-            Assert.That(init.IsValid, Is.True);
-            Assert.That(id, Is.Not.Empty);
-        });
-
-        var item = await WaitForTerminalAsync(client, id);
-
-        Assert.Multiple(() =>
-        {
-            Assert.That(item.Status, Is.EqualTo(StreamingDownloadStatus.Completed));
-            Assert.That(item.Success, Is.True);
-            Assert.That(item.AlbumId, Is.EqualTo("yt:abc123"));
-            Assert.That(item.Album!.Title, Is.EqualTo("Album"));
+            Assert.That(item.Title, Is.EqualTo("Artist A - Song"), "host import parses this title");
+            Assert.That(item.Status, Is.EqualTo(DownloadItemStatus.Completed));
+            Assert.That(item.DownloadClientInfo.Protocol, Is.EqualTo(nameof(NzbDrone.Core.Indexers.YtDlpDownloadProtocol)));
+            Assert.That(item.DownloadClientInfo.Id, Is.EqualTo(3));
+            Assert.That(item.DownloadClientInfo.Name, Is.EqualTo("TestClient"));
+            Assert.That(item.OutputPath.FullPath, Is.EqualTo(Path.Combine(_root, "Artist A - Song")));
+            Assert.That(Directory.Exists(Path.Combine(_root, "Artist A - Song")), Is.True);
         });
     }
 
     [Test]
-    public async Task Enqueue_invalid_album_id_throws()
+    public void Download_rejects_non_youtube_urls_with_release_exception()
     {
-        await using var client = new YtDlpDownloadClient(NoDelaySettings(), SuccessfulFake());
+        var album = RemoteAlbum();
+        album.Release = new ReleaseInfo
+        {
+            Title = "Artist A - Song",
+            Artist = "Artist A",
+            Album = "Song",
+            DownloadUrl = "https://example.com/song.mp3"
+        };
 
-        // ValueTask → Task so the action fits NUnit's Func<Task> constraint shape.
-        Func<Task> act = () => client.EnqueueAlbumDownloadAsync("not-a-valid-token", _outputDir).AsTask();
-        Assert.That(act, Throws.TypeOf<ArgumentException>());
+        var ex = Assert.Throws<ReleaseDownloadException>(() => _client.Download(album, Substitute.For<IIndexer>()));
+        Assert.That(ex!.Release.DownloadUrl, Is.EqualTo("https://example.com/song.mp3"));
     }
 
     [Test]
-    public async Task Duplicate_enqueue_returns_existing_id_while_active()
+    public async Task Duplicate_download_while_active_returns_same_id()
     {
-        var fake = SuccessfulFake();
-        fake.StreamBlock = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        await using var client = new YtDlpDownloadClient(NoDelaySettings(), fake);
+        // Hold the job in-flight so the second enqueue sees it as not-terminal.
+        var blocker = new TaskCompletionSource();
+        _fake.StreamBlock = blocker;
 
-        var id1 = await client.EnqueueAlbumDownloadAsync("playlist:PL1234567890abcdef", _outputDir);
-        var id2 = await client.EnqueueAlbumDownloadAsync("playlist:PL1234567890abcdef", _outputDir);
-        var id3 = await client.EnqueueAlbumDownloadAsync("playlist:PL1234567890abcdef#2", _outputDir); // normalized form
-
-        fake.StreamBlock.TrySetResult();
-        await WaitForTerminalAsync(client, id1);
-
-        Assert.Multiple(() =>
+        var id1 = await _client.Download(RemoteAlbum(), Substitute.For<IIndexer>());
+        // Let the first job reach the streaming block.
+        for (var i = 0; i < 200 && _fake.StreamStarted < 1; i++)
         {
-            Assert.That(id2, Is.EqualTo(id1), "same album+path while active → same id");
-            Assert.That(id3, Is.EqualTo(id1), "normalized token (#N stripped) → same id");
-            Assert.That(fake.Calls.Count(c => !c.Contains("--simulate")), Is.EqualTo(1), "exactly one real download ran (probe excluded)");
-        });
-    }
-
-    [Test]
-    public async Task GetActiveDownloads_shows_active_and_recent_terminal_items()
-    {
-        var fake = SuccessfulFake();
-        fake.StreamBlock = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        await using var client = new YtDlpDownloadClient(NoDelaySettings(), fake);
-
-        var id = await client.EnqueueAlbumDownloadAsync("yt:abc123", _outputDir);
-        var whileQueued = await client.GetActiveDownloadsAsync();
-        Assert.That(whileQueued, Has.Count.EqualTo(1));
-
-        fake.StreamBlock.TrySetResult();
-        var item = await WaitForTerminalAsync(client, id);
-        var afterDone = await client.GetActiveDownloadsAsync();
-
-        Assert.Multiple(() =>
-        {
-            Assert.That(item.IsCompleted, Is.True);
-            Assert.That(afterDone, Has.Count.EqualTo(1), "terminal item stays visible during grace period");
-            Assert.That(afterDone[0].Id, Is.EqualTo(id));
-        });
-    }
-
-    [Test]
-    public async Task Remove_active_download_cancels_and_deletes_data()
-    {
-        var fake = SuccessfulFake();
-        var block = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        fake.StreamBlock = block;
-        Directory.CreateDirectory(_outputDir);
-        File.WriteAllText(Path.Combine(_outputDir, "partial.mp3"), "data");
-
-        await using var client = new YtDlpDownloadClient(NoDelaySettings(), fake);
-        var id = await client.EnqueueAlbumDownloadAsync("yt:abc123", _outputDir);
-
-        // Let the download reach the in-flight state (probe done, stream blocked).
-        while (fake.StreamStarted < 1 && fake.Calls.Count < 2)
-        {
-            await Task.Delay(10);
+            await Task.Delay(5);
         }
 
-        var removed = await client.RemoveDownloadAsync(id, deleteData: true);
-        block.TrySetResult();
+        var id2 = await _client.Download(RemoteAlbum(), Substitute.For<IIndexer>());
 
-        // The canceled run should settle to Cancelled.
-        var item = await client.GetDownloadAsync(id);
-        for (var i = 0; i < 100 && item != null && !item.IsCompleted; i++)
-        {
-            await Task.Delay(25);
-            item = await client.GetDownloadAsync(id);
-        }
+        Assert.That(id2, Is.EqualTo(id1), "same album+path while active → same DownloadId");
+
+        blocker.SetResult();
+        _ = await WaitFor(_client, id1, DownloadItemStatus.Completed);
+    }
+
+    [Test]
+    public async Task Failed_job_surfaces_error_message_as_item_message()
+    {
+        _fake.StreamLines.Clear();
+        _fake.StreamExitCode = 1;
+        _fake.StreamLines.Enqueue((null, "ERROR: [youtube] Signature extraction failed"));
+
+        var id = await _client.Download(RemoteAlbum(), Substitute.For<IIndexer>());
+
+        var item = await WaitFor(_client, id, DownloadItemStatus.Failed);
+        Assert.That(item.Message, Does.Contain("exited with code 1"));
+        Assert.That(item.Message, Does.Contain("Signature extraction failed"));
+    }
+
+    // ----- RemoveItem / MarkItemAsImported -----
+
+    [Test]
+    public async Task RemoveItem_drops_job_from_get_items()
+    {
+        var id = await _client.Download(RemoteAlbum(), Substitute.For<IIndexer>());
+        var item = await WaitFor(_client, id, DownloadItemStatus.Completed);
+
+        _client.RemoveItem(item, deleteData: false);
+
+        Assert.That(_client.GetItems().Any(i => i.DownloadId == id), Is.False);
+        Assert.That(Directory.Exists(Path.Combine(_root, "Artist A - Song")), Is.True, "deleteData=false keeps files");
+    }
+
+    [Test]
+    public async Task RemoveItem_with_deleteData_deletes_output_folder()
+    {
+        var id = await _client.Download(RemoteAlbum(), Substitute.For<IIndexer>());
+        var item = await WaitFor(_client, id, DownloadItemStatus.Completed);
+
+        // The host base class performs the delete through IDiskProvider; the
+        // substitute stands in for the filesystem, so we assert the call.
+        var folder = Path.Combine(_root, "Artist A - Song");
+        _diskProvider.FolderExists(folder).Returns(true);
+
+        _client.RemoveItem(item, deleteData: true);
+
+        Assert.That(_client.GetItems().Any(i => i.DownloadId == id), Is.False);
+        _diskProvider.Received().DeleteFolder(folder, true);
+    }
+
+    [Test]
+    public async Task MarkItemAsImported_keeps_item_visible_and_flags_import()
+    {
+        var id = await _client.Download(RemoteAlbum(), Substitute.For<IIndexer>());
+        var item = await WaitFor(_client, id, DownloadItemStatus.Completed);
+
+        _client.MarkItemAsImported(item); // must not throw (base default throws)
+
+        Assert.That(_client.GetItems().Any(i => i.DownloadId == id), Is.True,
+            "imported terminal items stay visible until grace expiry/removal");
+    }
+
+    // ----- status / test -----
+
+    [Test]
+    public void GetStatus_reports_download_root()
+    {
+        var status = _client.GetStatus();
 
         Assert.Multiple(() =>
         {
-            Assert.That(removed, Is.True);
-            Assert.That(Directory.Exists(_outputDir), Is.False, "deleteData removes the output directory");
+            Assert.That(status.IsLocalhost, Is.False);
+            Assert.That(status.OutputRootFolders.Select(p => p.FullPath), Does.Contain(_root));
         });
     }
 
     [Test]
-    public async Task Remove_unknown_download_returns_false()
+    public void Test_reports_missing_download_path()
     {
-        await using var client = new YtDlpDownloadClient(NoDelaySettings(), SuccessfulFake());
+        _client.Definition = new DownloadClientDefinition
+        {
+            Id = 3,
+            Name = "TestClient",
+            Settings = new YtDlpClientSettings { YtDlpPath = "yt-dlp" }
+        };
 
-        Assert.That(await client.RemoveDownloadAsync("does-not-exist"), Is.False);
+        var result = _client.Test();
+
+        Assert.That(result.IsValid, Is.False);
+        Assert.That(result.Errors.Any(e => e.PropertyName == "DownloadPath"));
     }
 
     [Test]
-    public async Task Initialize_fails_when_path_unconfigured()
+    public void Test_maps_connection_errors_into_failures()
     {
-        var settings = NoDelaySettings();
-        settings.YtDlpPath = string.Empty;
-        await using var client = new YtDlpDownloadClient(settings, SuccessfulFake());
+        YtDlpConnectionTest.Override = (s, ct) => Task.FromResult(new ConnectionTestResult(
+            new[] { new ConnectionTestError("YtDlpPath", "yt-dlp not found.") },
+            Array.Empty<string>()));
 
-        var result = await client.InitializeAsync();
+        var result = _client.Test();
 
         Assert.Multiple(() =>
         {
             Assert.That(result.IsValid, Is.False);
-            Assert.That(result.Errors, Does.Contain("ytDlpPath is not configured."));
+            Assert.That(result.Errors.Any(e => e.PropertyName == "YtDlpPath"));
+        });
+    }
+
+    // ----- pure helpers -----
+
+    [Test]
+    public void ResolveAlbumTitle_prefers_release_then_matched_then_parsed()
+    {
+        var release = new ReleaseInfo { Title = "Artist A - Song", Album = "Song", Artist = "Artist A" };
+        var album = new RemoteAlbum { Release = release, Albums = new List<Album> { new() { Title = "Matched" } } };
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(YtDlpDownloadClient.ResolveAlbumTitle(album, release), Is.EqualTo("Song"), "release.Album wins");
+
+            release.Album = string.Empty;
+            Assert.That(YtDlpDownloadClient.ResolveAlbumTitle(album, release), Is.EqualTo("Matched"), "matched album second");
+
+            album.Albums = null;
+            Assert.That(YtDlpDownloadClient.ResolveAlbumTitle(album, release), Is.EqualTo("Song"), "parse 'Artist - Album' last");
+
+            var bare = new ReleaseInfo { Title = "NoDashTitle" };
+            Assert.That(YtDlpDownloadClient.ResolveAlbumTitle(new RemoteAlbum { Release = bare }, bare), Is.EqualTo("NoDashTitle"));
         });
     }
 
     [Test]
-    public async Task Failed_download_surfaces_error_and_stays_visible()
+    public void SanitizeDirectoryName_collapses_whitespace_and_handles_empty()
     {
-        var fake = SuccessfulFake();
-        fake.StreamExitCode = 1;
-        fake.StreamLines.Clear();
-        fake.StreamLines.Enqueue((null, "ERROR: [youtube] abc123: bot check failed"));
-
-        await using var client = new YtDlpDownloadClient(NoDelaySettings(), fake);
-        var id = await client.EnqueueAlbumDownloadAsync("yt:abc123", _outputDir);
-        var item = await WaitForTerminalAsync(client, id);
-        var stillVisible = await client.GetDownloadAsync(id);
-
         Assert.Multiple(() =>
         {
-            Assert.That(item.Status, Is.EqualTo(StreamingDownloadStatus.Failed));
-            Assert.That(item.Success, Is.False);
-            Assert.That(item.ErrorMessage, Does.Contain("bot check failed"));
-            Assert.That(stillVisible, Is.SameAs(item));
+            Assert.That(YtDlpDownloadClient.SanitizeDirectoryName("   A   B  "), Is.EqualTo("A B"));
+            Assert.That(YtDlpDownloadClient.SanitizeDirectoryName(""), Is.EqualTo("download"));
+            Assert.That(YtDlpDownloadClient.SanitizeDirectoryName("   "), Is.EqualTo("download"));
+            Assert.That(YtDlpDownloadClient.SanitizeDirectoryName("trailing..."), Is.EqualTo("trailing"));
+        });
+    }
+
+    [Test]
+    public void Host_surface_matches_native_contract()
+    {
+        Assert.Multiple(() =>
+        {
+            Assert.That(_client, Is.InstanceOf<DownloadClientBase<YtDlpClientSettings>>());
+            Assert.That(_client.Name, Is.EqualTo("YouTube (yt-dlp)"));
+            Assert.That(_client.Protocol, Is.EqualTo(nameof(NzbDrone.Core.Indexers.YtDlpDownloadProtocol)));
+            Assert.That(_client.ConfigContract, Is.EqualTo(typeof(YtDlpClientSettings)));
         });
     }
 }

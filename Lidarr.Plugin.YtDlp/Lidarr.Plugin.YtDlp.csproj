@@ -9,67 +9,102 @@
     <AssemblyName>Lidarr.Plugin.YtDlp</AssemblyName>
     <GenerateDocumentationFile>false</GenerateDocumentationFile>
     <!--
+      The host projects reference each other (e.g. Lidarr.Core -> Lidarr.SignalR).
+      Without this, MSBuild synthesizes transitive project references and copies
+      those assemblies (and their content) into the plugin output. We only compile
+      against the three direct references above; nothing in the plugin references
+      the host's other projects, so transitive project edges are pure noise.
+    -->
+    <DisableTransitiveProjectReferences>true</DisableTransitiveProjectReferences>
+    <!--
+      InformationalVersion is read by the host's Plugin.InstalledVersion
+      (NzbDrone.Core.Plugins.Plugin) for the System -> Plugins UI and the
+      GitHub update check. Keep it a plain "major.minor[.patch]" so
+      PluginVersion.Parse succeeds.
+    -->
+    <InformationalVersion>0.2.0</InformationalVersion>
+    <!--
       Copy resolved NuGet reference assemblies into the output folder so the
-      Release-only ILRepack step can merge them in. The shippable artifact is
-      built by the ZipRelease target from an explicit file list, so these
-      sidecars never end up in the plugin zip.
+      Release-only ILRepack step can merge CliWrap in. Host project references
+      below are marked runtime-excluded, so they never appear as output files.
     -->
     <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
   </PropertyGroup>
 
   <ItemGroup>
-    <!-- Versions must stay >= what the Lidarr.Plugin.Common/Abstractions submodule
-         references (CliWrap 3.10.1, M.E.Logging.Abstractions 8.0.3) to avoid NU1605. -->
     <PackageReference Include="CliWrap" Version="3.10.1" />
-    <PackageReference Include="FluentValidation" Version="9.5.4" />
-    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="8.0.3" />
     <!-- ILRepack MSBuild task (build-time only, never shipped). -->
     <PackageReference Include="ILRepack.Lib.MSBuild.Task" Version="2.0.48" PrivateAssets="all" />
   </ItemGroup>
 
   <ItemGroup>
     <!--
-      Only Abstractions is referenced: the host's PluginLoadContext
-      (ext/.../Abstractions/Hosting/PluginLoadContext.cs) SHARED-ASSEMBLIES
-      "Lidarr.Plugin.Abstractions" (and M.E.DI/Logging.Abstractions) with the host,
-      so the plugin must keep its reference to it un-merged for type identity.
-      Lidarr.Plugin.Common is deliberately NOT referenced: it is unused by this
-      plugin and would drag a 1.3 MB closure (DataProtection, TagLibSharp, M.E.*)
-      that cannot be merged (host-shared type identity) nor shipped (forbidden).
+      NATIVE host model: the plugin compiles against the exact Lidarr host
+      source (submodule pinned to v3.1.6.5079). These references are
+      COMPILE-TIME ONLY:
+        * ExcludeAssets="runtime" + Private=false => the host assemblies are
+          neither copied to the plugin output nor listed as runtime deps.
+        * At load time the host's collectible PluginLoadContext returns null
+          for anything it cannot resolve from the plugin folder, so these
+          types are bound against the host's own assemblies (same ALC).
+      Merging any of them would create duplicate type identities and break
+      every host interface we implement (verified against Tubifarry v2.3.1,
+      which ships with exactly these as external references).
+      FluentValidation, NLog, Newtonsoft.Json come transitively from the host
+      projects and must stay external for the same reason.
     -->
-    <ProjectReference Include="..\ext\Lidarr.Plugin.Common\src\Abstractions\Lidarr.Plugin.Abstractions.csproj" />
+    <ProjectReference Include="..\ext\Lidarr\src\NzbDrone.Common\Lidarr.Common.csproj"
+                      ExcludeAssets="runtime" Private="false" />
+    <ProjectReference Include="..\ext\Lidarr\src\NzbDrone.Core\Lidarr.Core.csproj"
+                      ExcludeAssets="runtime" Private="false" />
+    <ProjectReference Include="..\ext\Lidarr\src\Lidarr.Http\Lidarr.Http.csproj"
+                      ExcludeAssets="runtime" Private="false" />
   </ItemGroup>
 
   <ItemGroup>
-    <None Include="..\plugin.json" Link="plugin.json" CopyToOutputDirectory="PreserveNewest" />
-  </ItemGroup>
-
-  <ItemGroup>
-    <!-- Unit tests reach internal seams (settings external-test hook, parser helpers). -->
+    <!-- Unit tests reach internal seams (runner factory, scheduler delays, parser helpers). -->
     <InternalsVisibleTo Include="Lidarr.Plugin.YtDlp.Tests" />
   </ItemGroup>
 
   <!--
     Release packaging:
-      1. MergePluginDependencies — ILRepack merges CliWrap + FluentValidation into
-         Lidarr.Plugin.YtDlp.dll (internalized/renamed so they cannot collide with
-         host-provided copies across the collectible ALC). Everything else the DLL
-         references is either .NET 8 framework (default ALC) or host-shared
-         (Lidarr.Plugin.Abstractions, M.E.Logging.Abstractions).
-      2. ZipRelease — stages exactly {Lidarr.Plugin.YtDlp.dll, plugin.json} into
-         artifacts/net8.0.zip at the zip root, per the host install convention.
+      1. MergePluginDependencies (ILRepack.targets) merges CliWrap into
+         Lidarr.Plugin.YtDlp.dll, internalized + renamed so it cannot collide
+         with anything on the host. Host-contract dependencies (Lidarr.Core,
+         Lidarr.Common, Lidarr.Http, NLog, FluentValidation, Newtonsoft.Json)
+         stay EXTERNAL: the host resolves them, and its Test()/validation
+         signatures expose host-visible FluentValidation/NLog types.
+      2. ZipRelease stages exactly {Lidarr.Plugin.YtDlp.dll} at the zip root.
+         The native host loads only "Lidarr.Plugin.*.dll" from
+         {AppData}/plugins/{owner}/{name}/ and ignores plugin.json entirely.
   -->
-  <!-- The merge itself lives in ILRepack.targets (whose presence also suppresses
-       the ILRepack package's built-in merge-everything fallback target). -->
   <PropertyGroup>
     <ZipToolsDir>$(MSBuildProjectDirectory)/../tools/zip-packager</ZipToolsDir>
     <ZipArtifactDir>$(MSBuildProjectDirectory)/../artifacts</ZipArtifactDir>
   </PropertyGroup>
 
+  <!--
+    Belt and braces: the host project references can still leak content (e.g.
+    Localization) or NuGet-native assets (runtimes/, sqlite) into the output.
+    Nothing in the final artifact except the plugin DLL and (pre-merge) CliWrap
+    is ever loaded or merged, so remove everything else before packaging.
+  -->
+  <Target Name="CleanExtraneousOutput" AfterTargets="Build" Condition="'$(IsCrossTargetingBuild)' != 'true'">
+    <ItemGroup>
+      <_ExtraneousOutput Include="$(TargetDir)**" Exclude="$(TargetDir)Lidarr.Plugin.YtDlp.dll;$(TargetDir)Lidarr.Plugin.YtDlp.pdb;$(TargetDir)Lidarr.Plugin.YtDlp.deps.json;$(TargetDir)CliWrap.dll" />
+    </ItemGroup>
+    <Delete Files="@(_ExtraneousOutput)" />
+  </Target>
+
   <Target Name="ZipRelease" AfterTargets="MergePluginDependencies" Condition="'$(Configuration)' == 'Release' and '$(SkipMerge)' != 'true' and '$(IsCrossTargetingBuild)' != 'true'">
     <MakeDir Directories="$(ZipArtifactDir)" />
     <Exec Command="dotnet build &quot;$(ZipToolsDir)/zip-packager.csproj&quot; -c Release -v q --nologo" />
-    <Exec Command="dotnet &quot;$(ZipToolsDir)/bin/Release/net8.0/zip-packager.dll&quot; &quot;$(ZipArtifactDir)/net8.0.zip&quot; &quot;$(TargetDir)Lidarr.Plugin.YtDlp.dll&quot; &quot;$(TargetDir)plugin.json&quot;" />
+    <!--
+      DOTNET_ROLL_FORWARD=Major lets the net8.0 tool also run on a host that
+      only has a newer runtime (e.g. a developer box with .NET 10). On the CI
+      image (sdk:8.0) it is a no-op.
+    -->
+    <Exec Command="dotnet &quot;$(ZipToolsDir)/bin/Release/net8.0/zip-packager.dll&quot; &quot;$(ZipArtifactDir)/net8.0.zip&quot; &quot;$(TargetDir)Lidarr.Plugin.YtDlp.dll&quot;" EnvironmentVariables="DOTNET_ROLL_FORWARD=Major" />
     <Message Importance="high" Text="Created plugin artifact: $(ZipArtifactDir)/net8.0.zip" />
   </Target>
 
