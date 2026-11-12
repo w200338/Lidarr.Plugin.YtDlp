@@ -1,12 +1,25 @@
-# CI for Lidarr.Plugin.YtDlp — build (Release, ILRepack-merged + zip) → test → package verify.
+# CI for Lidarr.Plugin.YtDlp (Phase 7: native host model).
 #
-# Note: the plugin project references the Lidarr.Plugin.Common submodule
-# (ext/Lidarr.Plugin.Common) for Lidarr.Plugin.Abstractions, so submodules must
-# be checked out. GIT_SUBMODULE_STRATEGY: recursive handles this for every job.
+# Target host: Lidarr v3.1.6.5079 (stable). The ext/Lidarr submodule is pinned
+# to that tag and supplies the host contract assemblies at compile time
+# (Private=false, so host DLLs are never copied into the plugin output).
+#
+# Pipeline:
+#   build   -> Release build: host submodule + plugin, ILRepack merge of CliWrap
+#              into Lidarr.Plugin.YtDlp.dll, zip to artifacts/net8.0.zip
+#   test    -> full test suite (JUnit report for GitLab)
+#   package -> independent verification of the shippable zip (packaging tests)
+#   release -> (tags only) publish the zip as a permanent GitLab release asset
+#
+# The shippable artifact is artifacts/net8.0.zip, which contains exactly one
+# entry: Lidarr.Plugin.YtDlp.dll (merged). Manual install location:
+#   /var/lib/lidarr/plugins/w200338/lidarr-plugin-ytdlp/Lidarr.Plugin.YtDlp.dll
+
 stages:
   - build
   - test
   - package
+  - release
 
 variables:
   GIT_SUBMODULE_STRATEGY: recursive
@@ -17,15 +30,22 @@ variables:
 default:
   image: mcr.microsoft.com/dotnet/sdk:8.0
 
-# Release build. The plugin project's Release-only targets run during this build:
-#   1. MergePluginDependencies — ILRepack merges CliWrap + FluentValidation into
-#      Lidarr.Plugin.YtDlp.dll (host-shared Abstractions/Logging stay external).
-#   2. ZipRelease — stages exactly {Lidarr.Plugin.YtDlp.dll, plugin.json} into
+# Release build. During the plugin project's Release build these targets run:
+#   1. CollectHostReferences  - stages host contract DLLs for ILRepack's LibraryPath
+#   2. MergePluginDependencies - ILRepack merges CliWrap into Lidarr.Plugin.YtDlp.dll.
+#      Host-supplied dependencies (Lidarr.*, NLog, FluentValidation, Newtonsoft.Json)
+#      stay EXTERNAL references because the stable host loads its own copies.
+#   3. ZipRelease             - stages exactly {Lidarr.Plugin.YtDlp.dll} into
 #      artifacts/net8.0.zip (the shippable artifact).
+#
+# -p:NuGetAudit=false / -p:EnableAnalyzers=false: the host submodule is pinned
+# external code that builds with TreatWarningsAsErrors=true. Disabling the audit
+# (against the live vulnerability DB) and analyzers keeps the build hermetic
+# against upstream database updates and SDK minor-version differences.
 build:
   stage: build
   script:
-    - dotnet build Lidarr.Plugin.YtDlp.sln --configuration Release -v minimal
+    - dotnet build Lidarr.Plugin.YtDlp.sln --configuration Release -v minimal -p:NuGetAudit=false -p:EnableAnalyzers=false
     - ls -la artifacts/
   artifacts:
     paths:
@@ -40,7 +60,9 @@ build:
 test:
   stage: test
   script:
-    - dotnet test Lidarr.Plugin.YtDlp.Tests/Lidarr.Plugin.YtDlp.Tests.csproj --configuration Release --no-build --logger "junit;LogFileName=test-results.xml"
+    # Absolute LogFileName: JunitXml.TestLogger resolves relative names against
+    # the test project directory, which would break the reports/junit path.
+    - dotnet test Lidarr.Plugin.YtDlp.Tests/Lidarr.Plugin.YtDlp.Tests.csproj --configuration Release --no-build --logger "junit;LogFileName=$CI_PROJECT_DIR/test-results.xml"
   artifacts:
     when: always
     paths:
@@ -51,8 +73,8 @@ test:
     expire_in: 1 week
 
 # Independent verification of the shippable artifact: re-runs the packaging test
-# suite against artifacts/net8.0.zip (zip contents, merged-DLL references, manifest
-# consistency). Needs the build job's artifact + the test project output.
+# suite against artifacts/net8.0.zip (zip contents, merged-DLL assembly
+# references, host-contract type-leak guards, type-load smoke tests).
 package:
   stage: package
   script:
@@ -67,3 +89,52 @@ package:
     paths:
       - artifacts/net8.0.zip
     expire_in: 1 month
+
+# Tag-triggered release: creates a permanent GitLab release on the tag and
+# attaches artifacts/net8.0.zip as a release asset.
+#
+# Uses the predefined CI_JOB_TOKEN with the JOB-TOKEN header, which GitLab
+# permits for creating releases on the current project. If the API call fails
+# (older GitLab version or tightened permissions), the job degrades gracefully:
+# it prints a manual command and keeps the zip available as a job artifact.
+release:
+  stage: release
+  needs:
+    - job: build
+      artifacts: true
+  script:
+    - |
+      VERSION="$CI_COMMIT_TAG"
+      echo "Publishing release $VERSION to $CI_API_V4_URL/projects/$CI_PROJECT_ID/releases"
+      if curl --fail --silent --show-error \
+          --header "JOB-TOKEN: $CI_JOB_TOKEN" \
+          --request POST \
+          --form "tag_name=$VERSION" \
+          --form "name=yt-dlp plugin $VERSION" \
+          --form "description=Minimum Lidarr Version: 3.1.6.5079
+
+      Native Lidarr plugin: YouTube (yt-dlp) indexer and download client with
+      SponsorBlock support.
+
+      Install (manual): unzip into
+      /var/lib/lidarr/plugins/w200338/lidarr-plugin-ytdlp/
+      so the plugin folder contains Lidarr.Plugin.YtDlp.dll, then restart Lidarr." \
+          --form "file=@artifacts/net8.0.zip" \
+          "$CI_API_V4_URL/projects/$CI_PROJECT_ID/releases"; then
+        echo "Release $VERSION created with artifact net8.0.zip."
+      else
+        echo "WARNING: release creation failed (check CI_JOB_TOKEN permissions)."
+        echo "Run this manually from a machine with GitLab access:"
+        echo "  curl --header 'JOB-TOKEN: \$CI_JOB_TOKEN' --request POST \\"
+        echo "    --form 'tag_name=$VERSION' \\"
+        echo "    --form 'name=yt-dlp plugin $VERSION' \\"
+        echo "    --form 'file=@artifacts/net8.0.zip' \\"
+        echo "    '$CI_API_V4_URL/projects/$CI_PROJECT_ID/releases'"
+        # Keep the pipeline green; the zip is still a job artifact below.
+      fi
+  artifacts:
+    paths:
+      - artifacts/net8.0.zip
+    expire_in: never
+  rules:
+    - if: '$CI_COMMIT_TAG'

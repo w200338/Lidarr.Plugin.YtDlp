@@ -1,0 +1,39 @@
+# Continuous integration for the GitHub mirror of the plugin.
+# Runs the same build + test pipeline as GitLab on pushes to the main branch
+# and on pull requests. (Release publishing lives in release.yml.)
+
+name: ci
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (with host submodule pinned to v3.1.6.5079)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      # -p:NuGetAudit=false / -p:EnableAnalyzers=false: the ext/Lidarr submodule
+      # is pinned external code with TreatWarningsAsErrors=true; disabling the
+      # audit and analyzers keeps the build hermetic.
+      - name: Build (Release, ILRepack merge + zip)
+        run: dotnet build Lidarr.Plugin.YtDlp.sln --configuration Release -v minimal -p:NuGetAudit=false -p:EnableAnalyzers=false
+
+      - name: Test
+        run: dotnet test Lidarr.Plugin.YtDlp.Tests/Lidarr.Plugin.YtDlp.Tests.csproj --configuration Release --no-build
+
+      - name: Packaging verification
+        run: dotnet test Lidarr.Plugin.YtDlp.Tests/Lidarr.Plugin.YtDlp.Tests.csproj --configuration Release --no-build --filter "FullyQualifiedName~Packaging"

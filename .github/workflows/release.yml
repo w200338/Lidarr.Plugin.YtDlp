@@ -1,0 +1,73 @@
+# Release publishing for the GitHub mirror.
+#
+# Lidarr's plugin install from GitHub (System > Plugins) requires:
+#   1. a GitHub release whose asset name contains "net8.0.zip"
+#   2. the release body containing "Minimum Lidarr Version: <version>"
+# so the host can version-gate the install. This workflow provides both.
+#
+# The GitHub mirror is a push mirror of the GitLab repository; tags are pushed
+# automatically by GitLab's push-mirror feature, which triggers this workflow.
+
+name: release
+
+on:
+  push:
+    tags:
+      - '*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (with host submodule pinned to v3.1.6.5079)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      # -p:NuGetAudit=false / -p:EnableAnalyzers=false: the ext/Lidarr submodule
+      # is pinned external code with TreatWarningsAsErrors=true; disabling the
+      # audit and analyzers keeps the build hermetic.
+      - name: Build (Release, ILRepack merge + zip)
+        run: dotnet build Lidarr.Plugin.YtDlp.sln --configuration Release -v minimal -p:NuGetAudit=false -p:EnableAnalyzers=false
+
+      - name: Test
+        run: dotnet test Lidarr.Plugin.YtDlp.Tests/Lidarr.Plugin.YtDlp.Tests.csproj --configuration Release --no-build
+
+      - name: Packaging verification
+        run: dotnet test Lidarr.Plugin.YtDlp.Tests/Lidarr.Plugin.YtDlp.Tests.csproj --configuration Release --no-build --filter "FullyQualifiedName~Packaging"
+
+      # Asset name "net8.0.zip" (contains "net8.0.zip") + the
+      # "Minimum Lidarr Version:" line in the body are what Lidarr checks.
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "yt-dlp plugin $GITHUB_REF_NAME" \
+            --notes "Minimum Lidarr Version: 3.1.6.5079
+
+          Native Lidarr plugin: YouTube (yt-dlp) indexer and download client with SponsorBlock support.
+
+          Install (UI): System > Plugins > install from
+          https://github.com/w200338/lidarr.plugin.ytdlp
+
+          Install (manual): unzip into
+          /var/lib/lidarr/plugins/w200338/lidarr-plugin-ytdlp/
+          so the plugin folder contains Lidarr.Plugin.YtDlp.dll, then restart Lidarr." \
+            artifacts/net8.0.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugin-release
+          path: artifacts/net8.0.zip
+          retention-days: 90
