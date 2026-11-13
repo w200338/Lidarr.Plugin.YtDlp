@@ -233,7 +233,10 @@ public class YtDlpDownloadClient : DownloadClientBase<YtDlpClientSettings>
         }
 
         using var cts = new CancellationTokenSource(TestTimeout);
-        var result = YtDlpConnectionTest.Run(Settings, cts.Token);
+        var result = YtDlpConnectionTest.Run(
+            Settings,
+            Settings.UseSponsorBlock ? Settings.SponsorBlockApiEndpoint : null,
+            cts.Token);
 
         foreach (var error in result.Errors)
         {

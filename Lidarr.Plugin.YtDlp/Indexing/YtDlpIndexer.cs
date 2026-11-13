@@ -1,8 +1,11 @@
 using System.Collections.Concurrent;
 using FluentValidation.Results;
 using NLog;
+using NzbDrone.Common.Extensions;
 using NzbDrone.Common.Http;
+using NzbDrone.Core;
 using NzbDrone.Core.Configuration;
+using NzbDrone.Core.Download;
 using NzbDrone.Core.IndexerSearch.Definitions;
 using NzbDrone.Core.Indexers;
 using NzbDrone.Core.Parser;
@@ -43,9 +46,18 @@ namespace Lidarr.Plugin.YtDlp.Indexing;
 ///  - <c>DownloadUrl</c> is the real YouTube watch/playlist URL (for album
 ///    search: the music browse URL, which the download client handles via
 ///    <see cref="YtDlpAlbumId.TryFromUrl"/>).
-///  - <c>Size</c> = 0 (unknown) → the host skips its size specifications.
-///  - <c>PublishDate</c> = DateTime.UtcNow (search time; yt-dlp's flat search
-///    gives no release date, and DateTime.MinValue rendered as an absurd age).
+///  - <c>PublishDate</c>: Dec 31 of the search-criteria album year (the host
+///    derives the display "Age" from it; Dec 31 keeps the release on the
+///    "old" side of EarlyReleaseSpecification's release-date check). Falls
+///    back to DateTime.UtcNow when the criteria carry no year.
+///  - <c>Size</c>: estimated from the summed flat-entry track durations when
+///    the inspection saw them (× a conservative bytes/sec for the enabled
+///    client's delivery mode), 0 (unknown) otherwise — the host skips its
+///    size specifications for Size = 0.
+///  - Quality: the host parses it from the release TITLE (not from the
+///    ReleaseInfo), so for re-encode delivery modes the title carries a
+///    host-parseable quality token ("MP3 VBR V0" / "AAC VBR" / "VORBIS Q10")
+///    instead of resolving to Unknown (which profiles disallow).
 ///
 /// Search failures never throw to the host — they return an empty list.
 /// </summary>
@@ -70,14 +82,17 @@ public class YtDlpIndexer : IndexerBase<YtDlpIndexerSettings>
 
     private readonly YtDlpCommandBuilder _builder = new();
     private readonly SemaphoreSlim _searchGate = new(1, 1);
+    private readonly IProviderRepository<DownloadClientDefinition>? _clientDefinitions;
 
     public YtDlpIndexer(
         IIndexerStatusService indexerStatusService,
         IConfigService configService,
         IParsingService parsingService,
-        Logger logger)
+        Logger logger,
+        IProviderRepository<DownloadClientDefinition>? clientDefinitions = null)
         : base(indexerStatusService, configService, parsingService, logger)
     {
+        _clientDefinitions = clientDefinitions;
     }
 
     public override string Name => "YouTube (yt-dlp)";
@@ -127,7 +142,7 @@ public class YtDlpIndexer : IndexerBase<YtDlpIndexerSettings>
             return Task.FromResult<IList<ReleaseInfo>>(new ReleaseInfo[0]);
         }
 
-        return FetchAlbumReleasesAsync(query, searchCriteria.Artist.Name, searchCriteria.AlbumTitle);
+        return FetchAlbumReleasesAsync(query, searchCriteria.Artist.Name, searchCriteria.AlbumTitle, searchCriteria.AlbumYear, searchCriteria);
     }
 
     public override Task<IList<ReleaseInfo>> Fetch(ArtistSearchCriteria searchCriteria)
@@ -148,7 +163,9 @@ public class YtDlpIndexer : IndexerBase<YtDlpIndexerSettings>
         using var cts = new CancellationTokenSource(TestTimeout);
         try
         {
-            var result = await YtDlpConnectionTest.RunAsync(Settings, cts.Token).ConfigureAwait(false);
+            // sponsorBlockEndpoint: null — the indexer never downloads, so
+            // SponsorBlock is not its concern (v0.2.4 settings split).
+            var result = await YtDlpConnectionTest.RunAsync(Settings, null, cts.Token).ConfigureAwait(false);
             foreach (var error in result.Errors)
             {
                 failures.Add(new ValidationFailure(error.Property, error.Message));
@@ -178,10 +195,12 @@ public class YtDlpIndexer : IndexerBase<YtDlpIndexerSettings>
     /// so no two yt-dlp commands overlap. Search/resolve failures never throw
     /// to the host — they yield an empty list / a fallback title.
     /// </summary>
-    private async Task<IList<ReleaseInfo>> FetchAlbumReleasesAsync(string query, string artist, string? albumHint)
+    private async Task<IList<ReleaseInfo>> FetchAlbumReleasesAsync(string query, string artist, string? albumHint, int albumYear, SearchCriteriaBase criteria)
     {
         IReadOnlyList<SearchEntry> entries = [];
         var resolutions = new ConcurrentDictionary<string, EntryResolution>();
+        var delivery = ResolveDeliveryMode();
+        var catalogHasDurations = CatalogHasReleaseDurations(criteria);
 
         await _searchGate.WaitAsync().ConfigureAwait(false);
         try
@@ -233,13 +252,52 @@ public class YtDlpIndexer : IndexerBase<YtDlpIndexerSettings>
             _searchGate.Release();
         }
 
+        var utcNow = DateTime.UtcNow;
         var releases = entries
             .Select(entry => MapAlbumRelease(entry, artist, albumHint, query,
-                resolutions.TryGetValue(entry.Id, out var resolved) ? resolved : (EntryResolution?)null))
+                resolutions.TryGetValue(entry.Id, out var resolved) ? resolved : (EntryResolution?)null,
+                albumYear, delivery, utcNow, catalogHasDurations))
             .Where(r => r != null)
             .ToList();
 
         return CleanupReleases(releases);
+    }
+
+    /// <summary>
+    /// The re-encode mode of the first enabled yt-dlp download client — it
+    /// determines what the release title's quality token must say and how
+    /// big a download will roughly be. Resolved at search time from the host's
+    /// provider repository (DI-injected); falls back to Disabled (no token,
+    /// generic estimate) when nothing usable is found or the lookup fails.
+    /// </summary>
+    private ReencodeFormat ResolveDeliveryMode()
+    {
+        if (_clientDefinitions is null)
+        {
+            return ReencodeFormat.Disabled;
+        }
+
+        try
+        {
+            foreach (var definition in _clientDefinitions.All())
+            {
+                if (!definition.Enable || definition.Implementation != nameof(YtDlpDownloadClient))
+                {
+                    continue;
+                }
+
+                if (definition.Settings is YtDlpClientSettings settings)
+                {
+                    return settings.Reencode;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.Debug(ex, "[{0}] Could not read download client settings; assuming no re-encode", Name);
+        }
+
+        return ReencodeFormat.Disabled;
     }
 
     /// <summary>
@@ -278,9 +336,12 @@ public class YtDlpIndexer : IndexerBase<YtDlpIndexerSettings>
 
     /// <summary>
     /// Flat re-fetch of one entry URL to read its real playlist/album title
-    /// (the music search page's flat entries carry no per-entry titles).
-    /// Returns null on any failure — the caller falls back to the
-    /// search-criteria-derived title.
+    /// (the music search page's flat entries carry no per-entry titles) and,
+    /// from the per-entry durations, the album's total duration (size
+    /// estimate). The flat page echoes the shared playlist fields on every
+    /// line, so the first non-empty value wins and durations are summed.
+    /// Returns null when no line carries a title — the caller falls back to
+    /// the search-criteria-derived title (and Size = 0).
     /// </summary>
     private async Task<EntryResolution?> ResolveEntryAsync(string entryUrl)
     {
@@ -296,15 +357,28 @@ public class YtDlpIndexer : IndexerBase<YtDlpIndexerSettings>
                 return null;
             }
 
+            string? title = null;
+            string? channel = null;
+            string? playlistId = null;
+            var totalDuration = 0.0;
+
             foreach (var line in result.StandardOutput.Split('\n'))
             {
-                if (SearchLineParser.TryParseInspectLine(line, out var resolution) && resolution != null)
+                if (!SearchLineParser.TryParseInspectLine(line, out var inspectLine))
                 {
-                    return resolution;
+                    continue;
+                }
+
+                title ??= inspectLine.Title;
+                channel ??= inspectLine.Channel;
+                playlistId ??= inspectLine.PlaylistId;
+                if (inspectLine.DurationSeconds is > 0)
+                {
+                    totalDuration += inspectLine.DurationSeconds!.Value;
                 }
             }
 
-            return null;
+            return title is null ? null : new EntryResolution(title, channel, playlistId, totalDuration);
         }
         catch (OperationCanceledException)
         {
@@ -361,14 +435,23 @@ public class YtDlpIndexer : IndexerBase<YtDlpIndexerSettings>
     /// resolved it. The download URL prefers the entry's canonical playlist
     /// URL (when the inspection resolved its playlist id) and falls back to
     /// the entry's browse URL, which yt-dlp (and the download client) also
-    /// accepts. Internal + static for unit tests.
+    /// accepts.
+    ///
+    /// PublishDate, Size and the title's quality token are the decision-
+    /// engine contract (see the class docs): album-year-based age, duration
+    /// estimate, re-encode-aware quality token. Internal + static for unit
+    /// tests.
     /// </summary>
     internal static ReleaseInfo? MapAlbumRelease(
         SearchEntry entry,
         string artist,
         string? albumHint,
         string query,
-        EntryResolution? resolved)
+        EntryResolution? resolved,
+        int albumYear,
+        ReencodeFormat delivery,
+        DateTime utcNow,
+        bool catalogHasDurations)
     {
         if (string.IsNullOrEmpty(entry.Id) || string.IsNullOrWhiteSpace(entry.Url))
         {
@@ -388,18 +471,97 @@ public class YtDlpIndexer : IndexerBase<YtDlpIndexerSettings>
             ? YtDlpAlbumId.PlaylistUrlBase + resolved.PlaylistId
             : entry.Url;
 
+        var title = $"{artist} - {album}";
+        var qualitySuffix = QualityTitleSuffix(delivery);
+        if (qualitySuffix is not null)
+        {
+            title = $"{title} ({qualitySuffix})";
+        }
+
         return new ReleaseInfo
         {
             Guid = entry.Id,
-            Title = $"{artist} - {album}",
+            Title = title,
             Artist = artist,
             Album = album,
             DownloadUrl = downloadUrl,
             InfoUrl = entry.Url,
-            PublishDate = DateTime.UtcNow,
-            Size = 0
+            PublishDate = PublishDateForYear(albumYear, utcNow),
+            Size = catalogHasDurations ? EstimateSizeBytes(resolved, delivery) : 0
         };
     }
+
+    /// <summary>
+    /// Dec 31 of the album year (the host derives the displayed "Age" from
+    /// PublishDate; Dec 31 makes a same-year release count as old, which
+    /// keeps EarlyReleaseSpecification from rejecting it). Falls back to the
+    /// search time for missing/implausible years (0, future).
+    /// </summary>
+    internal static DateTime PublishDateForYear(int albumYear, DateTime utcNow)
+    {
+        if (albumYear >= 1900 && albumYear <= utcNow.Year)
+        {
+            return new DateTime(albumYear, 12, 31, 0, 0, 0, DateTimeKind.Utc);
+        }
+
+        return utcNow;
+    }
+
+    /// <summary>
+    /// Host-parseable quality token for the delivery mode, or null (title
+    /// stays plain → host parses Unknown, as before) when there is no
+    /// accurate host quality for what yt-dlp will deliver:
+    ///  - MP3 re-encode → MP3 VBR V0 (libmp3lame -q:a 0 via --audio-quality 0)
+    ///  - AAC re-encode → AAC VBR (aac -q:a 0.1)
+    ///  - Vorbis re-encode → VORBIS Q10 (libvorbis -q:a 10)
+    ///  - Opus / Disabled → null: the host Quality enum has no Opus entry and
+    ///    "disabled" delivers the (unknown) source stream.
+    /// </summary>
+    internal static string? QualityTitleSuffix(ReencodeFormat delivery) => delivery switch
+    {
+        ReencodeFormat.Mp3 => "MP3 VBR V0",
+        ReencodeFormat.Aac => "AAC VBR",
+        ReencodeFormat.Vorbis => "VORBIS Q10",
+        _ => null
+    };
+
+    /// <summary>
+    /// Conservative bytes/second for the delivery mode (worst case the host
+    /// may compare against its min/max size specs, so over- rather than
+    /// under-estimate):
+    ///  - MP3 V0 ≈ up to ~245 kbps → 30,000 B/s
+    ///  - AAC VBR ≈ up to ~192 kbps → 28,000 B/s
+    ///  - Vorbis Q10 ≈ up to ~256 kbps → 32,000 B/s
+    ///  - source stream (e.g. Opus ≈ 160-200 kbps) → 32,000 B/s
+    /// </summary>
+    internal static double EstimatedBytesPerSecond(ReencodeFormat delivery) => delivery switch
+    {
+        ReencodeFormat.Mp3 => 30_000,
+        ReencodeFormat.Aac => 28_000,
+        _ => 32_000
+    };
+
+    /// <summary>Duration-based size estimate; 0 (unknown) when the inspection saw no durations.</summary>
+    internal static long EstimateSizeBytes(EntryResolution? resolved, ReencodeFormat delivery) =>
+        resolved is not null && resolved.TotalDurationSeconds > 0
+            ? (long)(resolved.TotalDurationSeconds * EstimatedBytesPerSecond(delivery))
+            : 0;
+
+    /// <summary>
+    /// Whether the host catalog has release durations for the searched
+    /// album(s) — mirroring AcceptableSizeSpecification's max-duration math.
+    /// Without catalog durations the host rejects ANY release with Size > 0
+    /// ("Album duration is 0"), so the plugin reports unknown size (0) in
+    /// that case and lets the host skip the size check, exactly as before.
+    /// </summary>
+    internal static bool CatalogHasReleaseDurations(SearchCriteriaBase? criteria) =>
+        criteria?.Albums is { Count: > 0 } albums &&
+        albums
+            .Select(a => a.AlbumReleases.Value
+                .Where(r => r.Monitored || a.AnyReleaseOk)
+                .Select(r => r.Duration)
+                .MaxOrDefault())
+            .Sum() > 0;
 
     internal static string NormalizeQuery(params string?[] parts)
     {

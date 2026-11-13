@@ -34,7 +34,8 @@ public sealed class YtDlpCommandBuilder
     /// URLs from the album search). Flat entries carry no per-entry title, so
     /// each entry is re-fetched flat once to read the playlist-level metadata.
     /// </summary>
-    public const string InspectPrintTemplate = "%(.{playlist_title,playlist_channel,playlist_id})j";
+    // duration: per-entry seconds, summed for the release size estimate.
+    public const string InspectPrintTemplate = "%(.{playlist_title,playlist_channel,playlist_id,duration})j";
 
     /// <summary>YouTube Music album search (albums section of the music search page).</summary>
     public IReadOnlyList<string> BuildAlbumSearchArgs(string query, int limit)

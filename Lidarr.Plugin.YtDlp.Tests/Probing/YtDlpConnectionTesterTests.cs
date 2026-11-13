@@ -72,14 +72,9 @@ public class YtDlpConnectionTesterTests
         return (new YtDlpConnectionTester(probe, sb), probe, sb);
     }
 
-    private static YtDlpSettings Settings(ReencodeFormat reencode = ReencodeFormat.Disabled, bool sponsorBlock = false) =>
-        new()
-        {
-            YtDlpPath = "yt-dlp",
-            Reencode = reencode,
-            UseSponsorBlock = sponsorBlock,
-            SponsorBlockApiEndpoint = YtDlpSettings.DefaultSponsorBlockEndpoint
-        };
+    private static YtDlpClientSettings Settings() => new() { YtDlpPath = "yt-dlp" };
+
+    private const string SbEndpoint = YtDlpSettings.DefaultSponsorBlockEndpoint;
 
     [Test]
     public async Task All_good_minimal_settings_passes_without_sb_check()
@@ -103,7 +98,7 @@ public class YtDlpConnectionTesterTests
     {
         var (tester, probe, sb) = Build();
 
-        _ = await tester.TestAsync(Settings(sponsorBlock: true));
+        _ = await tester.TestAsync(Settings(), SbEndpoint);
 
         Assert.Multiple(() =>
         {
@@ -118,7 +113,7 @@ public class YtDlpConnectionTesterTests
         var (tester, probe, sb) = Build();
         probe.YtDlp = ProbeCheckResult.Fail("yt-dlp not found or not runnable at '/x'.");
 
-        var result = await tester.TestAsync(Settings(reencode: ReencodeFormat.Opus, sponsorBlock: true));
+        var result = await tester.TestAsync(Settings(), SbEndpoint);
 
         Assert.Multiple(() =>
         {
@@ -137,7 +132,7 @@ public class YtDlpConnectionTesterTests
         var (tester, probe, _) = Build();
         probe.Ffmpeg = ProbeCheckResult.Fail("ffmpeg not found on PATH.");
 
-        var result = await tester.TestAsync(Settings(reencode: ReencodeFormat.Aac));
+        var result = await tester.TestAsync(Settings());
 
         Assert.Multiple(() =>
         {
@@ -153,7 +148,7 @@ public class YtDlpConnectionTesterTests
         var (tester, _, sb) = Build();
         sb.Result = ProbeCheckResult.Fail("SponsorBlock endpoint unreachable: Name or service not known");
 
-        var result = await tester.TestAsync(Settings(sponsorBlock: true));
+        var result = await tester.TestAsync(Settings(), SbEndpoint);
 
         Assert.That(result.Errors[0].Message, Does.Contain("SponsorBlock"));
     }
@@ -165,7 +160,7 @@ public class YtDlpConnectionTesterTests
         probe.Ffmpeg = ProbeCheckResult.Fail("ffmpeg broken.");
         sb.Result = ProbeCheckResult.Fail("sb down.");
 
-        var result = await tester.TestAsync(Settings(reencode: ReencodeFormat.Opus, sponsorBlock: true));
+        var result = await tester.TestAsync(Settings(), SbEndpoint);
 
         Assert.Multiple(() =>
         {

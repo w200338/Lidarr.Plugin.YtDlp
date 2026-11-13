@@ -30,7 +30,7 @@ public class YtDlpConnectionTestTests
         YtDlpRunners.ClearCache();
     }
 
-    private static YtDlpSettings Settings(bool sponsorBlock = false, ReencodeFormat reencode = ReencodeFormat.Disabled) =>
+    private static YtDlpClientSettings Settings(bool sponsorBlock = false, ReencodeFormat reencode = ReencodeFormat.Disabled) =>
         new()
         {
             YtDlpPath = "yt-dlp",
@@ -38,6 +38,10 @@ public class YtDlpConnectionTestTests
             Reencode = reencode,
             SponsorBlockApiEndpoint = YtDlpSettings.DefaultSponsorBlockEndpoint
         };
+
+    /// <summary>Endpoint as the download client provider would pass it (null unless SponsorBlock is enabled).</summary>
+    private static string? SbEndpoint(YtDlpClientSettings s) =>
+        s.UseSponsorBlock ? s.SponsorBlockApiEndpoint : null;
 
     [Test]
     public async Task Override_short_circuits_the_default_pipeline()
@@ -51,7 +55,7 @@ public class YtDlpConnectionTestTests
                 Array.Empty<string>()));
         };
 
-        var result = await YtDlpConnectionTest.RunAsync(Settings(), CancellationToken.None);
+        var result = await YtDlpConnectionTest.RunAsync(Settings(), null, CancellationToken.None);
 
         Assert.Multiple(() =>
         {
@@ -70,7 +74,7 @@ public class YtDlpConnectionTestTests
                 Array.Empty<ConnectionTestError>(),
                 new[] { "slow but working" }));
 
-        var result = await YtDlpConnectionTest.RunAsync(Settings(), CancellationToken.None);
+        var result = await YtDlpConnectionTest.RunAsync(Settings(), null, CancellationToken.None);
 
         Assert.Multiple(() =>
         {
@@ -86,7 +90,7 @@ public class YtDlpConnectionTestTests
         canceled.Cancel();
         YtDlpConnectionTest.Override = (s, ct) => Task.FromCanceled<ConnectionTestResult>(canceled.Token);
 
-        var result = YtDlpConnectionTest.Run(Settings(), CancellationToken.None);
+        var result = YtDlpConnectionTest.Run(Settings(), null, CancellationToken.None);
 
         Assert.Multiple(() =>
         {
@@ -108,7 +112,7 @@ public class YtDlpConnectionTestTests
         };
         YtDlpRunners.Factory = _ => fake;
 
-        var result = await YtDlpConnectionTest.RunAsync(Settings(), CancellationToken.None);
+        var result = await YtDlpConnectionTest.RunAsync(Settings(), null, CancellationToken.None);
 
         Assert.Multiple(() =>
         {
@@ -117,7 +121,7 @@ public class YtDlpConnectionTestTests
         });
 
         // Same path must hit the cache (one runner instance, not a new one).
-        var again = await YtDlpConnectionTest.RunAsync(Settings(), CancellationToken.None);
+        var again = await YtDlpConnectionTest.RunAsync(Settings(), null, CancellationToken.None);
         Assert.That(again.Success, Is.True);
         Assert.That(fake.Calls.Count(c => c.Contains("--version")), Is.EqualTo(2), "second test → second probe");
     }
@@ -138,7 +142,7 @@ public class YtDlpConnectionTestTests
             }
         };
 
-        var result = await YtDlpConnectionTest.RunAsync(Settings(), CancellationToken.None);
+        var result = await YtDlpConnectionTest.RunAsync(Settings(), null, CancellationToken.None);
 
         Assert.Multiple(() =>
         {

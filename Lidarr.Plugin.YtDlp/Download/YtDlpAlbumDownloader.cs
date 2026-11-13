@@ -26,10 +26,10 @@ public sealed class YtDlpAlbumDownloader
     private static readonly TimeSpan ProgressThrottle = TimeSpan.FromMilliseconds(500);
 
     private readonly IYtDlpRunner _runner;
-    private readonly YtDlpSettings _settings;
+    private readonly YtDlpClientSettings _settings;
     private readonly YtDlpCommandBuilder _builder = new();
 
-    public YtDlpAlbumDownloader(IYtDlpRunner runner, YtDlpSettings settings)
+    public YtDlpAlbumDownloader(IYtDlpRunner runner, YtDlpClientSettings settings)
     {
         _runner = runner ?? throw new ArgumentNullException(nameof(runner));
         _settings = settings ?? throw new ArgumentNullException(nameof(settings));

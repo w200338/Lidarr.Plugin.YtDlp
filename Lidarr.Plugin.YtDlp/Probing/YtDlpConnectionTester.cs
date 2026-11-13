@@ -21,12 +21,20 @@ public sealed class YtDlpConnectionTester
         _sponsorBlock = sponsorBlock ?? throw new ArgumentNullException(nameof(sponsorBlock));
     }
 
+    /// <param name="sponsorBlockEndpoint">
+    /// Non-null (and non-empty) to also verify the SponsorBlock endpoint.
+    /// The indexer passes null — it never downloads, so SponsorBlock is not
+    /// its concern (v0.2.4 settings split).
+    /// </param>
     /// <param name="probeUrl">
     /// Optional real video URL for the extraction probe (early bot-detection
     /// signal). Timeouts surface as warnings, never as failures.
     /// </param>
     public async Task<ConnectionTestResult> TestAsync(
-        YtDlpSettings settings, string? probeUrl = null, CancellationToken ct = default)
+        YtDlpSettings settings,
+        string? sponsorBlockEndpoint = null,
+        string? probeUrl = null,
+        CancellationToken ct = default)
     {
         var errors = new List<ConnectionTestError>();
         var warnings = new List<string>();
@@ -42,9 +50,9 @@ public sealed class YtDlpConnectionTester
             var ffmpeg = await _probe.CheckFfmpegAsync(ct).ConfigureAwait(false);
             Append(ffmpeg, "Ffmpeg", errors, warnings);
 
-            if (settings.UseSponsorBlock)
+            if (!string.IsNullOrWhiteSpace(sponsorBlockEndpoint))
             {
-                var sb = await _sponsorBlock.CheckEndpointAsync(settings.SponsorBlockApiEndpoint, ct).ConfigureAwait(false);
+                var sb = await _sponsorBlock.CheckEndpointAsync(sponsorBlockEndpoint, ct).ConfigureAwait(false);
                 Append(sb, "SponsorBlockApiEndpoint", errors, warnings);
             }
 

@@ -293,12 +293,16 @@ public class PackagingTests
         var asm = Assembly.LoadFile(MergedDll);
         var logger = LogManager.GetLogger("test");
 
+        // The client-definitions parameter is optional (null here = no
+        // delivery-mode lookup for size/quality hints); the host's DI
+        // injects its own IProviderRepository<DownloadClientDefinition>.
         var indexer = Activator.CreateInstance(
             asm.GetType("Lidarr.Plugin.YtDlp.Indexing.YtDlpIndexer")!,
             Substitute.For<IIndexerStatusService>(),
             Substitute.For<IConfigService>(),
             Substitute.For<IParsingService>(),
-            logger);
+            logger,
+            null);
 
         // The command queue parameter is optional (null here = no queue
         // refresh nudges); the host injects its own IManageCommandQueue.

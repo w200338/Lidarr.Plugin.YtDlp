@@ -1,18 +1,30 @@
 # PHASE 7 — Port to the native Lidarr plugin model + release pipeline
 
 ```
-STATUS: v0.2.3 IMPLEMENTED + LOCALLY VERIFIED (2026-11-13) — code, tests
-        (225/225), packaging, CI + docs all done; live E2E on the official
-        v3.1.6.5079 host (search → grab → download → import) including the
-        queue-refresh nudge that makes the activity queue show live progress.
+STATUS: v0.2.4 IMPLEMENTED (2026-11-13) — tests 245/245 green Debug+Release,
+        Release artifact rebuilt. Fixes the five v0.2.3 field reports:
+        (1) indexer age 0 minutes → PublishDate = Dec 31 of the catalog
+        AlbumYear (host-provided via AlbumSearchCriteria), (2) indexer size
+        0B → duration-based estimate from the entry inspection (sum of
+        per-entry durations × conservative bytes/s per re-encode mode),
+        (3) quality Unknown → host-parseable title token matching the
+        client's Re-encode mode (MP3 VBR V0 / AAC VBR / VORBIS Q10; Opus +
+        Disabled stay Unknown — the host Quality set has no Opus), (4)
+        Search Limit in the download client form → settings split: shared
+        base now holds only the yt-dlp path, SearchLimit lives on the
+        indexer settings, validators split to match, (5)
+        "Skipping provider of unknown type ..." → NOT this plugin; orphaned
+        Tubifarry provider rows, remediation documented. Full write-up:
+        docs/research/09-indexer-age-size-quality-fixes.md.
+        PREVIOUS: v0.2.3 (live queue progress nudge, faster search, no
+        redundant -f ba/b) — locally verified E2E on the official host.
         DONE (user-confirmed 2026-11-13): force push of the rewritten history
         to GitLab; GitHub push-mirror configured (commits AND tags).
         DO NOT re-request the push or the mirror setup — they are done.
-        REMAINING (user side): tag v0.2.3 on GitLab (pipeline → release with
+        REMAINING (user side): tag v0.2.4 on GitLab (pipeline → release with
         net8.0.zip → mirrored to GitHub), install/update on the user's host
-        (expect 0.2.3.0), live validation (queue progress, search, delay
-        profile). Debug history for the progress fix:
-        docs/research/08-live-queue-progress-debug.md.
+        (expect 0.2.4.0), live validation. Debug history for the progress
+        fix: docs/research/08-live-queue-progress-debug.md.
 REQUIRES: user confirmation (direction already expressed: stay on stable host,
           GitHub mirror OK, GitLab release required)
 RESEARCH: docs/research/07-native-model-port.md (contracts + packaging recipe)
@@ -506,14 +518,55 @@ search/grab/download/import, but rough edges) drove four fixes:
 
 ### Not changed (expected behavior, for the record)
 
-- `age: 0 minute` on search results: flat search exposes no release date;
-  we publish the search time (DateTime.MinValue rendered as an absurd age).
+- ~~`age: 0 minute` on search results~~ — SUPERSEDED by v0.2.4 (item 1
+  below): age is now derived from the catalog's album year.
 - Titles like `Artist - <searched album>`: that is the fallback for
   entries whose page inspection failed/timed out — the decision engine
   then rejects wrong albums (correct signal) and accepts the right one.
-- `Skipping provider of unknown type YouTubeIndexerSettings`: a stale
-  provider definition from an old YouTube plugin (e.g. Tubifarry) in the
-  host's database; unrelated to this plugin, safe to delete from the UI.
+- `Skipping provider of unknown type ...`: a stale provider definition
+  from a third-party plugin (Tubifarry) in the host's database; unrelated
+  to this plugin — see v0.2.4 item 5 below for the exact orphaned rows.
 - `Release rejected: YtDlpDownloadProtocol is not enabled for this
   artist`: delay-profile gate; enable the protocol on the artist's delay
   profile.
+
+## Post-v0.2.3 fixes (v0.2.4)
+
+User field report against v0.2.3 → five items. Full write-up with root
+causes, verification, and remediation:
+`docs/research/09-indexer-age-size-quality-fixes.md`.
+
+1. **Indexer age "0 minutes"** — `PublishDate` is now Dec 31 of the
+   catalog's `AlbumYear` (host-provided via `AlbumSearchCriteria`),
+   falling back to search time when the year is missing/future. Dec 31 is
+   never inside an EarlyReleaseSpecification window. (Fixes the
+   "expected behavior" note above.)
+2. **Indexer size `0B`** — duration-based estimate: the entry inspection
+   print template now includes per-entry `duration`; the indexer sums
+   them and multiplies by a conservative bytes/s for the enabled client's
+   re-encode mode (MP3 30,000 / AAC 28,000 / other 32,000). `0`
+   (unknown → host skips size specs) when no durations were seen. Plus a
+   catalog-duration guard: when the host catalog has no release durations
+   for the album, AcceptableSizeSpecification would reject any Size > 0
+   release, so the plugin reports 0 in that case (mirrors the spec's
+   math over searchCriteria.Albums).
+3. **Indexer quality `unknown`** — release titles gain a
+   host-parseable quality token when the enabled client re-encodes:
+   `(MP3 VBR V0)` / `(AAC VBR)` / `(VORBIS Q10)`. Opus and Disabled stay
+   `Unknown` (the host Quality value set has no Opus). Verified against
+   the real host `Parser` in `HostQualityParseContractTests`.
+4. **Search Limit on the download client form** — settings split:
+   `YtDlpSettings` is now abstract and holds only the yt-dlp path;
+   `SearchLimit` moved to `YtDlpIndexerSettings`; validators split to
+   match; the connection test takes the SponsorBlock endpoint explicitly.
+   `SchemaBuilder` tests prove the forms no longer leak fields into each
+   other. Existing saved configs survive (property-name deserialization).
+5. **`Skipping provider of unknown type ...`** — confirmed NOT this
+   plugin: orphaned **Tubifarry** provider rows in the DB
+   (`MixedMetadataProxySettings`, `SykHookMetadataProxySettings`,
+   `SearchSniperTaskSettings`, `LastfmMetadataProxySettings`).
+   Remediation: reinstall Tubifarry or delete the orphaned rows (exact
+   SQL in the research doc).
+
+Status: 245/245 green Debug + Release; Release artifact rebuilt
+(`artifacts/net8.0.zip`).

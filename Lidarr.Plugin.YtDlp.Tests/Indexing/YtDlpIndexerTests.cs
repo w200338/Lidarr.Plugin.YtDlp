@@ -363,6 +363,8 @@ public class YtDlpIndexerTests
         });
     }
 
+    private static readonly DateTime FixedNow = new(2026, 10, 30, 12, 0, 0, DateTimeKind.Utc);
+
     [Test]
     public void MapAlbumRelease_prefers_resolved_title_then_criteria_then_query()
     {
@@ -370,33 +372,162 @@ public class YtDlpIndexerTests
 
         // 1. Resolved (real album title from the flat re-fetch) wins. A resolved
         //    playlist id upgrades the download URL to the canonical playlist.
-        var r1 = YtDlpIndexer.MapAlbumRelease(entry, "Artist A", "Great Album", "Artist A Great Album", new EntryResolution("Real Album", null, "OLAK5_test1"));
+        var r1 = YtDlpIndexer.MapAlbumRelease(entry, "Artist A", "Great Album", "Artist A Great Album",
+            new EntryResolution("Real Album", null, "OLAK5_test1", 0), 2011, ReencodeFormat.Disabled, FixedNow, true);
         Assert.Multiple(() =>
         {
             Assert.That(r1, Is.Not.Null);
             Assert.That(r1!.Title, Is.EqualTo("Artist A - Real Album"));
             Assert.That(r1.Artist, Is.EqualTo("Artist A"));
             Assert.That(r1.Album, Is.EqualTo("Real Album"));
-            Assert.That(r1.PublishDate, Is.EqualTo(DateTime.UtcNow).Within(TimeSpan.FromMinutes(1)));
+            Assert.That(r1.PublishDate, Is.EqualTo(new DateTime(2011, 12, 31)), "album-year based age");
             Assert.That(r1.DownloadUrl, Is.EqualTo("https://www.youtube.com/playlist?list=OLAK5_test1"),
                 "resolved playlist id → canonical playlist URL");
         });
 
         // 1b. Resolved title but no playlist id → browse URL fallback.
-        var r1b = YtDlpIndexer.MapAlbumRelease(entry, "Artist A", "Great Album", "Artist A Great Album", new EntryResolution("Real Album", null, null));
+        var r1b = YtDlpIndexer.MapAlbumRelease(entry, "Artist A", "Great Album", "Artist A Great Album",
+            new EntryResolution("Real Album", null, null, 0), 2011, ReencodeFormat.Disabled, FixedNow, true);
         Assert.That(r1b!.DownloadUrl, Is.EqualTo("https://music.youtube.com/browse/MPREb_1"));
 
         // 2. No resolution → criteria album title (parseable: it IS what the user searched).
-        var r2 = YtDlpIndexer.MapAlbumRelease(entry, "Artist A", "Great Album", "Artist A Great Album", null);
+        var r2 = YtDlpIndexer.MapAlbumRelease(entry, "Artist A", "Great Album", "Artist A Great Album", null, 2011, ReencodeFormat.Disabled, FixedNow, true);
         Assert.That(r2!.Title, Is.EqualTo("Artist A - Great Album"));
 
         // 3. No criteria album either (artist-only search) → the whole query.
-        var r3 = YtDlpIndexer.MapAlbumRelease(entry, "Artist A", null, "Artist A", null);
+        var r3 = YtDlpIndexer.MapAlbumRelease(entry, "Artist A", null, "Artist A", null, 2011, ReencodeFormat.Disabled, FixedNow, true);
         Assert.That(r3!.Title, Is.EqualTo("Artist A - Artist A"), "still the 'Artist - X' shape");
 
         // 4. Unusable entries are dropped.
-        Assert.That(YtDlpIndexer.MapAlbumRelease(new SearchEntry("", "https://x", "", "", null, "playlist"), "A", "B", "A B", null), Is.Null);
-        Assert.That(YtDlpIndexer.MapAlbumRelease(new SearchEntry("id", "ftp://x", "", "", null, "playlist"), "A", "B", "A B", null), Is.Null);
+        Assert.That(YtDlpIndexer.MapAlbumRelease(new SearchEntry("", "https://x", "", "", null, "playlist"), "A", "B", "A B", null, 2011, ReencodeFormat.Disabled, FixedNow, true), Is.Null);
+        Assert.That(YtDlpIndexer.MapAlbumRelease(new SearchEntry("id", "ftp://x", "", "", null, "playlist"), "A", "B", "A B", null, 2011, ReencodeFormat.Disabled, FixedNow, true), Is.Null);
+    }
+
+    [Test]
+    public void MapAlbumRelease_publish_date_uses_album_year_dec31()
+    {
+        var entry = new SearchEntry("MPREb_1", "https://music.youtube.com/browse/MPREb_1", "", "", null, "playlist");
+
+        // A released album: the age shown in the UI is now "years" not "0 minutes".
+        Assert.That(
+            YtDlpIndexer.MapAlbumRelease(entry, "A", "B", "A B", null, 2011, ReencodeFormat.Disabled, FixedNow, true)!.PublishDate,
+            Is.EqualTo(new DateTime(2011, 12, 31, 0, 0, 0, DateTimeKind.Utc)));
+
+        // Dec 31 is chosen deliberately: EarlyReleaseSpecification only rejects
+        // same-year releases whose publish date falls INSIDE the early-release
+        // window (album date + N days), and Dec 31 is never inside that window.
+        Assert.That(
+            YtDlpIndexer.PublishDateForYear(2011, FixedNow),
+            Is.EqualTo(new DateTime(2011, 12, 31, 0, 0, 0, DateTimeKind.Utc)));
+    }
+
+    [TestCase(0)]
+    [TestCase(-1)]
+    [TestCase(1899)]
+    [TestCase(2030)] // future year (bad metadata) → search time
+    public void PublishDate_falls_back_to_search_time_for_missing_or_future_years(int albumYear)
+    {
+        Assert.That(YtDlpIndexer.PublishDateForYear(albumYear, FixedNow), Is.EqualTo(FixedNow));
+    }
+
+    [Test]
+    public void MapAlbumRelease_estimates_size_from_entry_durations()
+    {
+        var entry = new SearchEntry("MPREb_1", "https://music.youtube.com/browse/MPREb_1", "", "", null, "playlist");
+
+        // 1710s = 28:30 of summed track durations (observed live: ~1689s for a 13-track album).
+        const double seconds = 1710;
+
+        Assert.That(
+            YtDlpIndexer.MapAlbumRelease(entry, "A", "B", "A B", new EntryResolution("B", null, null, seconds), 2011, ReencodeFormat.Mp3, FixedNow, true)!.Size,
+            Is.EqualTo((long)(seconds * 30_000)), "MP3 V0 estimate");
+        Assert.That(
+            YtDlpIndexer.MapAlbumRelease(entry, "A", "B", "A B", new EntryResolution("B", null, null, seconds), 2011, ReencodeFormat.Aac, FixedNow, true)!.Size,
+            Is.EqualTo((long)(seconds * 28_000)), "AAC VBR estimate");
+        Assert.That(
+            YtDlpIndexer.MapAlbumRelease(entry, "A", "B", "A B", new EntryResolution("B", null, null, seconds), 2011, ReencodeFormat.Disabled, FixedNow, true)!.Size,
+            Is.EqualTo((long)(seconds * 32_000)), "source-stream estimate");
+
+        // No resolved durations (inspection failed) → 0 = unknown, host skips size specs.
+        Assert.That(
+            YtDlpIndexer.MapAlbumRelease(entry, "A", "B", "A B", null, 2011, ReencodeFormat.Mp3, FixedNow, true)!.Size,
+            Is.EqualTo(0));
+    }
+
+    [Test]
+    public void MapAlbumRelease_reports_unknown_size_when_the_catalog_has_no_release_durations()
+    {
+        // AcceptableSizeSpecification rejects ANY Size > 0 release when the
+        // catalog album has no release durations ("Album duration is 0"), so
+        // the plugin must report 0 (unknown) in that case — the host then
+        // skips the size check entirely, as it did before v0.2.4.
+        var entry = new SearchEntry("MPREb_1", "https://music.youtube.com/browse/MPREb_1", "", "", null, "playlist");
+        var resolved = new EntryResolution("B", null, null, 1710);
+
+        Assert.That(
+            YtDlpIndexer.MapAlbumRelease(entry, "A", "B", "A B", resolved, 2011, ReencodeFormat.Mp3, FixedNow, false)!.Size,
+            Is.EqualTo(0), "no catalog durations → unknown size");
+        Assert.That(
+            YtDlpIndexer.MapAlbumRelease(entry, "A", "B", "A B", resolved, 2011, ReencodeFormat.Mp3, FixedNow, true)!.Size,
+            Is.Not.EqualTo(0), "catalog durations present → estimate is reported");
+    }
+
+    [Test]
+    public void CatalogHasReleaseDurations_mirrors_the_hosts_acceptable_size_math()
+    {
+        var album = new NzbDrone.Core.Music.Album
+        {
+            Title = "B",
+            AnyReleaseOk = true,
+            AlbumReleases = new List<NzbDrone.Core.Music.AlbumRelease>
+            {
+                new() { Monitored = true, Duration = 240_000 }
+            }
+        };
+
+        // Same album shape but durationless release (catalog without duration data):
+        var bareAlbum = new NzbDrone.Core.Music.Album
+        {
+            Title = "B",
+            AnyReleaseOk = true,
+            AlbumReleases = new List<NzbDrone.Core.Music.AlbumRelease>
+            {
+                new() { Monitored = true, Duration = 0 }
+            }
+        };
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(YtDlpIndexer.CatalogHasReleaseDurations(new AlbumSearchCriteria { Albums = new List<NzbDrone.Core.Music.Album> { album } }),
+                Is.True, "catalog release with duration → estimate may be reported");
+            Assert.That(YtDlpIndexer.CatalogHasReleaseDurations(new AlbumSearchCriteria { Albums = new List<NzbDrone.Core.Music.Album> { bareAlbum } }),
+                Is.False, "durationless catalog → unknown size, host skips size check");
+            // No albums at all → false.
+            Assert.That(YtDlpIndexer.CatalogHasReleaseDurations(new AlbumSearchCriteria { Albums = new List<NzbDrone.Core.Music.Album>() }), Is.False);
+            Assert.That(YtDlpIndexer.CatalogHasReleaseDurations(null), Is.False);
+        });
+    }
+
+    [Test]
+    public void MapAlbumRelease_adds_host_parseable_quality_token_for_reencode_modes()
+    {
+        var entry = new SearchEntry("MPREb_1", "https://music.youtube.com/browse/MPREb_1", "", "", null, "playlist");
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(YtDlpIndexer.MapAlbumRelease(entry, "A", "B", "A B", null, 2011, ReencodeFormat.Mp3, FixedNow, true)!.Title,
+                Is.EqualTo("A - B (MP3 VBR V0)"));
+            Assert.That(YtDlpIndexer.MapAlbumRelease(entry, "A", "B", "A B", null, 2011, ReencodeFormat.Aac, FixedNow, true)!.Title,
+                Is.EqualTo("A - B (AAC VBR)"));
+            Assert.That(YtDlpIndexer.MapAlbumRelease(entry, "A", "B", "A B", null, 2011, ReencodeFormat.Vorbis, FixedNow, true)!.Title,
+                Is.EqualTo("A - B (VORBIS Q10)"));
+            // Opus: the host Quality enum has no Opus entry → no token (Unknown), as before.
+            Assert.That(YtDlpIndexer.MapAlbumRelease(entry, "A", "B", "A B", null, 2011, ReencodeFormat.Opus, FixedNow, true)!.Title,
+                Is.EqualTo("A - B"));
+            // Disabled: the delivered stream is the unknown source → no token, as before.
+            Assert.That(YtDlpIndexer.MapAlbumRelease(entry, "A", "B", "A B", null, 2011, ReencodeFormat.Disabled, FixedNow, true)!.Title,
+                Is.EqualTo("A - B"));
+        });
     }
 
     [Test]

@@ -92,30 +92,29 @@ public class SearchLineParserTests
     public void InspectLine_strips_album_page_prefix()
     {
         // The music browse page titles albums "Album - <name>" (observed shape).
-        Assert.That(SearchLineParser.TryParseInspectLine("{\"playlist_title\":\"Album - 21\",\"playlist_channel\":null}", out var resolution), Is.True);
+        Assert.That(SearchLineParser.TryParseInspectLine("{\"playlist_title\":\"Album - 21\",\"playlist_channel\":null}", out var lineInfo), Is.True);
         Assert.Multiple(() =>
         {
-            Assert.That(resolution, Is.Not.Null);
-            Assert.That(resolution!.Title, Is.EqualTo("21"));
-            Assert.That(resolution.Channel, Is.Null);
+            Assert.That(lineInfo.Title, Is.EqualTo("21"));
+            Assert.That(lineInfo.Channel, Is.Null);
         });
     }
 
     [Test]
     public void InspectLine_without_prefix_is_used_verbatim()
     {
-        Assert.That(SearchLineParser.TryParseInspectLine("{\"playlist_title\":\"30 \"}", out var resolution), Is.True);
-        Assert.That(resolution!.Title, Is.EqualTo("30"), "trimmed");
+        Assert.That(SearchLineParser.TryParseInspectLine("{\"playlist_title\":\"30 \"}", out var lineInfo), Is.True);
+        Assert.That(lineInfo.Title, Is.EqualTo("30"), "trimmed");
     }
 
     [Test]
     public void InspectLine_carries_channel_when_present()
     {
-        Assert.That(SearchLineParser.TryParseInspectLine("{\"playlist_title\":\"Mix 1\",\"playlist_channel\":\"Adele\"}", out var resolution), Is.True);
+        Assert.That(SearchLineParser.TryParseInspectLine("{\"playlist_title\":\"Mix 1\",\"playlist_channel\":\"Adele\"}", out var lineInfo), Is.True);
         Assert.Multiple(() =>
         {
-            Assert.That(resolution!.Title, Is.EqualTo("Mix 1"));
-            Assert.That(resolution.Channel, Is.EqualTo("Adele"));
+            Assert.That(lineInfo.Title, Is.EqualTo("Mix 1"));
+            Assert.That(lineInfo.Channel, Is.EqualTo("Adele"));
         });
     }
 
@@ -125,15 +124,32 @@ public class SearchLineParserTests
         // Observed live: music album browse pages expose the embedded album
         // playlist (OLAK...) which the indexer turns into the canonical
         // playlist download URL.
-        Assert.That(SearchLineParser.TryParseInspectLine("{\"playlist_title\":\"Album - 21\",\"playlist_channel\":null,\"playlist_id\":\"OLAK5uy_kNiuS8m9gEwAoTTt62VFPFwPFMdqDC8Oo\"}", out var resolution), Is.True);
-        Assert.That(resolution!.PlaylistId, Is.EqualTo("OLAK5uy_kNiuS8m9gEwAoTTt62VFPFwPFMdqDC8Oo"));
+        Assert.That(SearchLineParser.TryParseInspectLine("{\"playlist_title\":\"Album - 21\",\"playlist_channel\":null,\"playlist_id\":\"OLAK5uy_kNiuS8m9gEwAoTTt62VFPFwPFMdqDC8Oo\"}", out var lineInfo), Is.True);
+        Assert.That(lineInfo.PlaylistId, Is.EqualTo("OLAK5uy_kNiuS8m9gEwAoTTt62VFPFwPFMdqDC8Oo"));
     }
 
     [Test]
-    public void InspectLine_without_playlist_id_yields_null_playlist_id()
+    public void InspectLine_carries_per_entry_duration_for_size_estimates()
     {
-        Assert.That(SearchLineParser.TryParseInspectLine("{\"playlist_title\":\"Album - 21\"}", out var resolution), Is.True);
-        Assert.That(resolution!.PlaylistId, Is.Null);
+        // Observed live: flat browse lines expose the per-entry duration (seconds),
+        // which the indexer sums into the release size estimate.
+        Assert.That(SearchLineParser.TryParseInspectLine("{\"playlist_title\":\"Album - 21\",\"duration\":245.5,\"title\":\"Rolling in the Deep\"}", out var lineInfo), Is.True);
+        Assert.That(lineInfo.DurationSeconds, Is.EqualTo(245.5));
+    }
+
+    [Test]
+    public void InspectLine_without_known_fields_yields_all_nulls()
+    {
+        // A valid JSON line that happens to carry none of the inspect fields is
+        // still "parsed" (all nulls) - the aggregator treats it as no-op.
+        Assert.That(SearchLineParser.TryParseInspectLine("{\"title\":\"a plain video line\"}", out var lineInfo), Is.True);
+        Assert.Multiple(() =>
+        {
+            Assert.That(lineInfo.Title, Is.Null);
+            Assert.That(lineInfo.Channel, Is.Null);
+            Assert.That(lineInfo.PlaylistId, Is.Null);
+            Assert.That(lineInfo.DurationSeconds, Is.Null);
+        });
     }
 
     [TestCase(null!)]
@@ -141,11 +157,8 @@ public class SearchLineParserTests
     [TestCase("   ")]
     [TestCase("WARNING: something yt-dlp grumbled")]
     [TestCase("{not json}")]
-    [TestCase("{\"title\":\"a plain video line without playlist_title\"}")]
-    [TestCase("{\"playlist_title\":\"   \"}")]
     public void InspectLine_rejects_non_inspect_lines(string line)
     {
-        Assert.That(SearchLineParser.TryParseInspectLine(line, out var resolution), Is.False);
-        Assert.That(resolution, Is.Null);
+        Assert.That(SearchLineParser.TryParseInspectLine(line, out _), Is.False);
     }
 }

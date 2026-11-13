@@ -14,14 +14,28 @@ public sealed record SearchEntry(
 /// <summary>
 /// What one flat entry inspection (browse/playlist page re-fetch) resolved:
 /// the real album title, the page's channel, and - when the page embeds an
-/// album playlist - its playlist id. The playlist id lets the indexer emit
-/// a canonical <c>youtube.com/playlist?list=</c> download URL that the
-/// download client accepts without any extra URL handling.
+/// album playlist - its playlist id (lets the indexer emit a canonical
+/// <c>youtube.com/playlist?list=</c> download URL that the download client
+/// accepts without any extra URL handling), plus the summed per-entry
+/// durations (seconds) for the release size estimate.
 /// </summary>
 public sealed record EntryResolution(
     string Title,
     string? Channel,
-    string? PlaylistId);
+    string? PlaylistId,
+    double TotalDurationSeconds);
+
+/// <summary>
+/// One JSON line of a flat entry inspection. The flat page echoes the shared
+/// playlist fields on every line (per track entry), so aggregation takes the
+/// first non-empty value for title/channel/playlist-id and sums durations.
+/// All fields are optional: a line may carry only some of them.
+/// </summary>
+public sealed record InspectLine(
+    string? Title,
+    string? Channel,
+    string? PlaylistId,
+    double? DurationSeconds);
 
 /// <summary>
 /// Parses the JSON-per-line output of <see cref="Commands.YtDlpCommandBuilder.PrintTemplate"/>
@@ -82,13 +96,15 @@ public static class SearchLineParser
 
     /// <summary>
     /// Parses one JSON line of <see cref="Commands.YtDlpCommandBuilder.InspectPrintTemplate"/>
-    /// into the entry's real title/channel/playlist-id. The "Album - " page
-    /// prefix is stripped from the title. Returns false for non-JSON lines or
-    /// lines without a playlist_title (e.g. track entries with no metadata).
+    /// into its per-line fields (title/channel/playlist-id/duration). The
+    /// "Album - " page prefix is stripped from the title. Returns false for
+    /// non-JSON lines; a valid JSON line that happens to carry none of the
+    /// fields of interest still returns true (all-null fields) so callers
+    /// don't have to distinguish "noise" from "empty metadata".
     /// </summary>
-    public static bool TryParseInspectLine(string line, out EntryResolution? resolution)
+    public static bool TryParseInspectLine(string line, out InspectLine lineInfo)
     {
-        resolution = null;
+        lineInfo = new InspectLine(null, null, null, null);
         if (string.IsNullOrWhiteSpace(line))
         {
             return false;
@@ -105,22 +121,17 @@ public static class SearchLineParser
             using var doc = JsonDocument.Parse(trimmed);
             var root = doc.RootElement;
 
-            var rawTitle = root.TryGetProperty("playlist_title", out var t) && t.ValueKind == JsonValueKind.String
-                ? t.GetString() ?? string.Empty
-                : string.Empty;
-
-            if (string.IsNullOrWhiteSpace(rawTitle))
+            string? title = null;
+            if (root.TryGetProperty("playlist_title", out var t) && t.ValueKind == JsonValueKind.String)
             {
-                return false;
-            }
-
-            var title = rawTitle.StartsWith(AlbumTitlePrefix, StringComparison.Ordinal)
-                ? rawTitle[AlbumTitlePrefix.Length..].Trim()
-                : rawTitle.Trim();
-
-            if (title.Length == 0)
-            {
-                return false;
+                var rawTitle = t.GetString() ?? string.Empty;
+                title = rawTitle.StartsWith(AlbumTitlePrefix, StringComparison.Ordinal)
+                    ? rawTitle[AlbumTitlePrefix.Length..].Trim()
+                    : rawTitle.Trim();
+                if (title.Length == 0)
+                {
+                    title = null;
+                }
             }
 
             var channel = root.TryGetProperty("playlist_channel", out var c) && c.ValueKind == JsonValueKind.String
@@ -135,7 +146,11 @@ public static class SearchLineParser
                 playlistId = playlistId!.Trim();
             }
 
-            resolution = new EntryResolution(title, channel, playlistId);
+            var durationSeconds = root.TryGetProperty("duration", out var d) && d.ValueKind == JsonValueKind.Number
+                ? (double?)d.GetDouble()
+                : null;
+
+            lineInfo = new InspectLine(title, channel, playlistId, durationSeconds);
             return true;
         }
         catch (JsonException)

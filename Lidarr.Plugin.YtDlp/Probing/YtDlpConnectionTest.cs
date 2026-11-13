@@ -14,11 +14,16 @@ public static class YtDlpConnectionTest
     /// <summary>Override point for tests (replace the whole pipeline with a fake).</summary>
     internal static Func<YtDlpSettings, CancellationToken, Task<ConnectionTestResult>>? Override { get; set; }
 
-    public static Task<ConnectionTestResult> RunAsync(YtDlpSettings settings, CancellationToken ct)
+    /// <param name="sponsorBlockEndpoint">
+    /// Non-null (and non-empty) to also verify the SponsorBlock endpoint
+    /// (download client only; the indexer passes null).
+    /// </param>
+    public static Task<ConnectionTestResult> RunAsync(
+        YtDlpSettings settings, string? sponsorBlockEndpoint = null, CancellationToken ct = default)
     {
         return Override is not null
             ? Override(settings, ct)
-            : CreateDefaultTester(settings).TestAsync(settings, null, ct);
+            : CreateDefaultTester(settings).TestAsync(settings, sponsorBlockEndpoint, null, ct);
     }
 
     /// <summary>
@@ -26,11 +31,11 @@ public static class YtDlpConnectionTest
     /// (DownloadClientBase.Test(List&lt;ValidationFailure&gt;)). The async test is
     /// bounded (caller passes a limited CTS), so blocking is safe here.
     /// </summary>
-    public static ConnectionTestResult Run(YtDlpSettings settings, CancellationToken ct)
+    public static ConnectionTestResult Run(YtDlpSettings settings, string? sponsorBlockEndpoint = null, CancellationToken ct = default)
     {
         try
         {
-            return RunAsync(settings, ct).GetAwaiter().GetResult();
+            return RunAsync(settings, sponsorBlockEndpoint, ct).GetAwaiter().GetResult();
         }
         catch (OperationCanceledException)
         {

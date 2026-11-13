@@ -35,7 +35,7 @@ Requires:
 - `docs/` — research notes (`docs/research/`) and implementation plans
   (`docs/plans/`, one per phase, each with a STATUS line)
 - `Lidarr.Plugin.YtDlp/` — plugin source (net8.0, C# 12)
-- `Lidarr.Plugin.YtDlp.Tests/` — NUnit 3 + NSubstitute tests (225 tests)
+- `Lidarr.Plugin.YtDlp.Tests/` — NUnit 3 + NSubstitute tests (245 tests)
 - `ext/Lidarr` — git submodule pinned to tag `v3.1.6.5079` (host source;
   compile-time contract only, `Private=false`, never shipped)
 - `tools/zip-packager/` — tiny helper that builds the release zip
@@ -124,8 +124,19 @@ plugins folder, and restarts. The release body's
 
 ## Settings
 
-Both providers share the yt-dlp settings; the download client adds the
-download folder.
+The two providers have separate settings forms (v0.2.4); they share only
+the yt-dlp path. Existing saved configs are unaffected — the host
+deserializes stored settings by property name.
+
+**Indexer form:**
+
+| Setting | Type | Default | Description |
+|---|---|---|---|
+| yt-dlp path | string, **required** | — | Full path to the yt-dlp executable (or `yt-dlp` when on the Lidarr process PATH). |
+| search limit | number | `25` | Max results per search (clamped to 1–100). |
+| early release limit (days) | number | — | Host standard: ignore releases published more than N days early. |
+
+**Download client form:**
 
 | Setting | Type | Default | Description |
 |---|---|---|---|
@@ -136,9 +147,7 @@ download folder.
 | re-encode | select | `disabled` | Re-encode audio at max quality: `disabled`, `mp3`, `aac`, `opus`, `vorbis`. `disabled` keeps the source codec (extracted losslessly via ffmpeg). |
 | min download delay (s) | number | `5` | Minimum seconds between downloads (start of the randomized pause). |
 | max download delay (s) | number | `30` | Maximum seconds between downloads (end of the randomized pause). |
-| search limit | number | `25` | Max results per search (clamped to 1–100). |
-| download folder *(client)* | path, **required** | — | Root folder where downloads are placed before import. |
-| early release limit (days) *(indexer)* | number | — | Host standard: ignore releases published more than N days early. |
+| download folder | path, **required** | — | Root folder where downloads are placed before import. |
 
 ### How the download spacing works
 
@@ -172,7 +181,7 @@ save with an unhandled exception.
   creates a GitHub release whose asset `net8.0.zip` and body
   (`Minimum Lidarr Version: 3.1.6.5079`) satisfy Lidarr's plugin installer.
   `.github/workflows/ci.yml` runs the same build + tests on pushes/PRs.
-- **Tagging a release**: `git tag v0.2.0 && git push origin v0.2.0` (or the
+- **Tagging a release**: `git tag v0.2.4 && git push origin v0.2.4` (or the
   equivalent from your fork) — both pipelines pick the tag up automatically.
 
 ## Troubleshooting

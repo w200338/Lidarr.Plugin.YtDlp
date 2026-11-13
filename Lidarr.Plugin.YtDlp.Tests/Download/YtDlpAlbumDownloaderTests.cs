@@ -16,7 +16,7 @@ public class YtDlpAlbumDownloaderTests
     private const string SingleVideo = "abc123";
     private const string Playlist = "PL123";
 
-    private static YtDlpSettings Settings() => new()
+    private static YtDlpClientSettings Settings() => new()
     {
         YtDlpPath = "yt-dlp",
         MinDownloadDelaySeconds = 0,
