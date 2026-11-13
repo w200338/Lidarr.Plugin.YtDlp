@@ -1,10 +1,12 @@
 # PHASE 7 — Port to the native Lidarr plugin model + release pipeline
 
 ```
-STATUS: IMPLEMENTED (2026-11-12) — code, tests (198/198), packaging, CI + docs
-        all done locally. REMAINING: push commits to GitLab, set up GitHub
-        push-mirror, tag a release, and live validation on the user's
-        v3.1.6.5079 host (see Implementation record at the bottom).
+STATUS: v0.2.3 IMPLEMENTED + LOCALLY VERIFIED (2026-11-13) — code, tests
+        (225/225), packaging, CI + docs all done; live E2E on the official
+        v3.1.6.5079 host (search → grab → download → import) including the
+        queue-refresh nudge that makes the activity queue show live progress.
+        REMAINING (user side): push commits to GitLab, set up the GitHub
+        push-mirror, tag v0.2.3, and live validation on the user's host.
 REQUIRES: user confirmation (direction already expressed: stay on stable host,
           GitHub mirror OK, GitLab release required)
 RESEARCH: docs/research/07-native-model-port.md (contracts + packaging recipe)
@@ -358,10 +360,10 @@ reference-version guards).
    and cannot reach `gitlab.gitgudaim.com`).
 2. Configure the GitLab push-mirror to `https://github.com/w200338/lidarr.plugin.ytdlp`
    (mirror commits **and tags**) and confirm that GitHub repository name.
-3. Tag `v0.2.2` → GitLab release job publishes the zip; mirror tag →
-   GitHub release for the UI install path (`v0.2.1` is already out and only
-   contains the load-compatibility fix; `v0.2.2` adds everything listed in
-   the post-0.2.1 fixes section above).
+3. Tag `v0.2.3` → GitLab release job publishes the zip; mirror tag →
+   GitHub release for the UI install path (`v0.2.1` = load-compatibility
+   fix only; `v0.2.2` = post-0.2.1 fixes; `v0.2.3` = the fixes listed in
+   the post-0.2.2 section below).
 4. Live validation on the user's host: manual install to
    `/var/lib/lidarr/plugins/w200338/lidarr-plugin-ytdlp/`, restart,
    System → Plugins shows `YtDlp`; add download client + indexer,
@@ -443,3 +445,69 @@ grab (HTTP 200) → queue (`downloading` → `completed`) → download
 (11 × `.opus`, audio only) → import (11 tracks moved to
 `{root}/Adele/`) → album statistics show the files. 220/220 tests green
 in Debug and Release.
+
+## Post-0.2.2 fixes (v0.2.3)
+
+Field-test feedback on v0.2.2 (correct version display, working
+search/grab/download/import, but rough edges) drove four fixes:
+
+1. **Queue progress bar** ("no progress visible in the activity screen").
+   Two stacked problems:
+   a. The host queue row computes `progress = 100 - sizeleft/size` from
+      `DownloadClientItem.TotalSize`/`RemainingSize`; we reported 0/0, so
+      the bar was NaN. `YtDlpProgressParser` now also parses the current
+      file's total size (`of ~ 12.50MiB`) and `ETA 00:05` from yt-dlp's
+      `--newline` progress lines; `DownloadJobState` carries them;
+      `MapItem` reports `TotalSize`/`RemainingSize`/`RemainingTime` while
+      downloading (the bar fills per track, the status message names the
+      track; queued/terminal items report 0/0 and hide the bar). The queue
+      API maps these to `size`/`sizeleft`/`timeleft` (`QueueService`
+      lines 78-80).
+   b. Even with correct size fields, the UI still showed nothing: the
+      queue rows are rendered from the host's `TrackedDownload.DownloadItem`
+      snapshots, which are only refreshed when the host runs
+      `RefreshMonitoredDownloads` — a scheduled command on a ~1 minute
+      (up to ~90 s, observed in the command API) cadence. Downloads
+      shorter than that window only ever appear as
+      `Downloading size=0` → `Completed`. Fix (host untouched):
+      `YtDlpDownloadClient` now receives the host's `IManageCommandQueue`
+      via DI (`ProviderFactory.GetInstance` resolves the provider through
+      the host container) and, while a job is not terminal, pushes the
+      host's own `RefreshMonitoredDownloadsCommand` (high priority) every
+      5 s (`StartQueueRefreshNudge`). The host's command equality
+      de-duplicates overlapping pushes, the loop exits when the job goes
+      terminal or is removed, and a 60 min cap bounds it. Verified live on
+      the official v3.1.6.5079 host: the command history shows refreshes
+      at 5 s intervals exactly during the download window (none after),
+      and the queue row updates live — status message names the current
+      track (`Downloading: 04 - Don't You Remember`) and `size` carries
+      the current file's total bytes, so the progress bar renders.
+2. **Search speed + `Entry inspection timed out` log spam.** Entry title
+   inspection is now bounded-parallel (3 concurrent flat fetches, still
+   under the single-flight search gate) instead of serial, so one slow
+   entry costs at most one timeout instead of blocking N-1 others; the
+   per-entry backstop grew 30s → 60s and inspect args gained
+   `--socket-timeout 20` so hung sockets die earlier. Worst case for 10
+   entries dropped from 10×T to ~4×T with a much larger T.
+3. **Redundant `-f ba/b`** (user observation, verified in yt-dlp source):
+   when `-x` is given without `-f`, yt-dlp defaults the format to
+   `bestaudio/best` (`yt_dlp/__init__.py` parseOpts: "Do not
+   unnecessarily download audio") — exactly what `ba/b` said. Removed from
+   both the re-encode and no-re-encode paths; `-x` remains the
+   audio-extraction/no-video guarantee.
+4. **Docs/tests** for all of the above; 225/225 green in Debug and
+   Release (new test: `Active_download_nudges_host_queue_refresh_and_stops_when_terminal`).
+
+### Not changed (expected behavior, for the record)
+
+- `age: 0 minute` on search results: flat search exposes no release date;
+  we publish the search time (DateTime.MinValue rendered as an absurd age).
+- Titles like `Artist - <searched album>`: that is the fallback for
+  entries whose page inspection failed/timed out — the decision engine
+  then rejects wrong albums (correct signal) and accepts the right one.
+- `Skipping provider of unknown type YouTubeIndexerSettings`: a stale
+  provider definition from an old YouTube plugin (e.g. Tubifarry) in the
+  host's database; unrelated to this plugin, safe to delete from the UI.
+- `Release rejected: YtDlpDownloadProtocol is not enabled for this
+  artist`: delay-profile gate; enable the protocol on the artist's delay
+  profile.

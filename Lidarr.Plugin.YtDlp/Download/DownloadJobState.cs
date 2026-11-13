@@ -31,6 +31,15 @@ public sealed class DownloadJobState
     public YtDlpJobStatus Status { get; private set; } = YtDlpJobStatus.Queued;
     public double Progress { get; private set; }
     public string? CurrentTrack { get; private set; }
+
+    /// <summary>Bytes of the file currently downloading (0 when idle/unknown).</summary>
+    public long CurrentFileTotalBytes { get; private set; }
+
+    /// <summary>Bytes remaining of the file currently downloading.</summary>
+    public long CurrentFileRemainingBytes { get; private set; }
+
+    /// <summary>Estimated remaining time of the file currently downloading.</summary>
+    public TimeSpan? CurrentTrackEta { get; private set; }
     public bool Success { get; private set; }
     public string? ErrorMessage { get; private set; }
     public DateTime CreatedAt { get; private set; } = DateTime.UtcNow;
@@ -57,6 +66,11 @@ public sealed class DownloadJobState
 
     public void UpdateProgress(double progress, string? currentTrack)
     {
+        UpdateProgress(progress, currentTrack, 0, 0, null);
+    }
+
+    public void UpdateProgress(double progress, string? currentTrack, long fileTotalBytes, long fileRemainingBytes, TimeSpan? trackEta)
+    {
         lock (this)
         {
             if (IsCompleted)
@@ -66,6 +80,9 @@ public sealed class DownloadJobState
 
             Progress = progress;
             CurrentTrack = currentTrack;
+            CurrentFileTotalBytes = fileTotalBytes;
+            CurrentFileRemainingBytes = fileRemainingBytes;
+            CurrentTrackEta = trackEta;
             LastUpdated = DateTime.UtcNow;
         }
     }

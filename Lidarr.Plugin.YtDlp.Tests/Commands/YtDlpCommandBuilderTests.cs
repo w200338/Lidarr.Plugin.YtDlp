@@ -84,8 +84,10 @@ public class YtDlpCommandBuilderTests
             Assert.That(args, Does.Contain("--no-warnings"));
             Assert.That(args, Does.Contain("--no-color"));
             Assert.That(args, Does.Contain("--newline"));
-            Assert.That(args, Does.Contain("-f"));
-            Assert.That(args[Idx(args, "-f") + 1], Is.EqualTo("ba/b"));
+            // No -f: with -x and no explicit format, yt-dlp itself defaults
+            // to "bestaudio/best" (best audio-only, falling back to the best
+            // combined format), so an explicit "-f ba/b" would be redundant.
+            Assert.That(args, Does.Not.Contain("-f"), "yt-dlp's -x default format (bestaudio/best) covers it");
             // Audio extraction without re-encoding: -x keeps the source codec
             // and writes a codec-appropriate, host-accepted container
             // (YouTube's best audio is Opus → .opus, not .webm).
@@ -120,6 +122,7 @@ public class YtDlpCommandBuilderTests
 
         Assert.Multiple(() =>
         {
+            Assert.That(args, Does.Not.Contain("-f"), "yt-dlp's -x default format (bestaudio/best) covers it");
             Assert.That(args, Does.Contain("-x"));
             Assert.That(args, Does.Contain("--audio-format"));
             Assert.That(args[Idx(args, "--audio-format") + 1], Is.EqualTo(expectedYtDlpFormat));

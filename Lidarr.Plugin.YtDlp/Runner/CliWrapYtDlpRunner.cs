@@ -85,11 +85,20 @@ public sealed class CliWrapYtDlpRunner : IYtDlpRunner
                 {
                     case StandardOutputCommandEvent @out:
                         stdout.Append(@out.Text).Append('\n');
-                        handlers.OnStdOutLine(@out.Text);
+                        // A single CliWrap event can contain several lines;
+                        // the IYtDlpRunner contract promises line-split
+                        // callbacks, so split explicitly.
+                        foreach (var line in SplitLines(@out.Text))
+                        {
+                            handlers.OnStdOutLine(line);
+                        }
                         break;
                     case StandardErrorCommandEvent @err:
                         stderr.Append(@err.Text).Append('\n');
-                        handlers.OnStdErrLine(@err.Text);
+                        foreach (var line in SplitLines(@err.Text))
+                        {
+                            handlers.OnStdErrLine(line);
+                        }
                         break;
                     case ExitedCommandEvent exited:
                         exitCode = exited.ExitCode;
@@ -112,6 +121,14 @@ public sealed class CliWrapYtDlpRunner : IYtDlpRunner
         }
 
         return new YtDlpRunResult(exitCode, stdout.ToString(), stderr.ToString());
+    }
+
+    private static IEnumerable<string> SplitLines(string text)
+    {
+        foreach (var line in text.Split('\n'))
+        {
+            yield return line.TrimEnd('\r');
+        }
     }
 
     private Command BuildCommand(IReadOnlyList<string> args) =>

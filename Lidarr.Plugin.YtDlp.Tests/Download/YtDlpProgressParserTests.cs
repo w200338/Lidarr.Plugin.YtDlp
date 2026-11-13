@@ -125,4 +125,65 @@ public class YtDlpProgressParserTests
             Assert.That(parser.Feed("[download] Destination: /data/Song.webm"), Is.False, "same stem twice = no change");
         });
     }
+
+    [Test]
+    public void Progress_line_yields_current_file_size_and_eta()
+    {
+        var parser = new YtDlpProgressParser();
+        Feed(parser,
+            "[download] Destination: /data/Song.webm",
+            "[download]   5.0% of ~ 2.00MiB at 1.00MiB/s ETA 00:05");
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(parser.CurrentFileTotalBytes, Is.EqualTo(2L * 1024 * 1024), "2.00MiB");
+            Assert.That(parser.CurrentFileRemainingBytes, Is.EqualTo((long)(2L * 1024 * 1024 * 0.95)).Within(2L * 1024), "5% done ≈ 95% left");
+            Assert.That(parser.CurrentTrackEta, Is.EqualTo(TimeSpan.FromSeconds(5)));
+        });
+
+        Feed(parser, "[download]  50.0% of ~ 2.00MiB at 1.00MiB/s ETA 00:03");
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(parser.CurrentFileRemainingBytes, Is.EqualTo(2L * 1024 * 1024 / 2).Within(2L * 1024), "50% done ≈ 50% left");
+            Assert.That(parser.CurrentTrackEta, Is.EqualTo(TimeSpan.FromSeconds(3)));
+        });
+    }
+
+    [Test]
+    public void File_completion_clears_eta_and_new_file_resets_size()
+    {
+        var parser = new YtDlpProgressParser();
+        Feed(parser,
+            "[download] Destination: /data/01 - First.webm",
+            "[download]  10.0% of ~ 2.00MiB at 1.00MiB/s ETA 00:04",
+            "[download] 100% of  1.80MiB in 00:01 at 1.80MiB/s");
+
+        Assert.That(parser.CurrentTrackEta, Is.Null, "file finished → no eta");
+
+        Feed(parser,
+            "[download] Destination: /data/02 - Second.webm",
+            "[download]   5.0% of ~ 3.00MiB at 1.00MiB/s ETA 00:02");
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(parser.CurrentFileTotalBytes, Is.EqualTo(3L * 1024 * 1024), "second file's size replaces the first");
+            Assert.That(parser.CurrentTrackEta, Is.EqualTo(TimeSpan.FromSeconds(2)));
+        });
+    }
+
+    [Test]
+    public void Size_units_are_parsed_binary_and_decimal()
+    {
+        var parser = new YtDlpProgressParser();
+
+        Feed(parser, "[download] Destination: /data/Song.webm");
+        Feed(parser, "[download]  10.0% of ~ 1.50GiB at 1.00MiB/s");
+        Assert.That(parser.CurrentFileTotalBytes, Is.EqualTo((long)(1.5 * 1024d * 1024 * 1024)), "GiB");
+
+        var parser2 = new YtDlpProgressParser();
+        Feed(parser2, "[download] Destination: /data/Song.webm");
+        Feed(parser2, "[download]  10.0% of  500KB at 1.00MiB/s");
+        Assert.That(parser2.CurrentFileTotalBytes, Is.EqualTo(500_000L), "KB is decimal");
+    }
 }

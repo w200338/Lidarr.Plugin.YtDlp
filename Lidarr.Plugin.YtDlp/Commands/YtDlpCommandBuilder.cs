@@ -54,6 +54,7 @@ public sealed class YtDlpCommandBuilder
         "--no-warnings",
         "--no-color",
         "--flat-playlist",
+        "--socket-timeout", "20",
         "--print",
         InspectPrintTemplate,
         entryUrl
@@ -166,20 +167,21 @@ public sealed class YtDlpCommandBuilder
         var formatName = ReencodeAudioFormats.GetYtDlpFormat(reencode);
         if (formatName == null)
         {
-            // Audio only, no re-encode: "ba/b" prefers the best audio-only
-            // stream (always present on YouTube), and "-x" without
-            // --audio-format extracts it losslessly into a container that
-            // matches the source codec (opus, m4a, ogg, ...). The -x also
-            // guarantees no video is ever downloaded even if the /b fallback
-            // hits a combined video+audio stream on a non-YouTube URL, and
-            // the resulting extensions are all accepted by the host's media
-            // scanner (which does not accept .webm).
-            return new List<string> { "-f", "ba/b", "-x", "--embed-metadata" };
+            // Audio only, no re-encode. No -f is needed: when -x is given
+            // without -f, yt-dlp defaults the format to "bestaudio/best"
+            // (its "do not unnecessarily download audio" logic), i.e. the
+            // best audio-only stream, falling back to the best combined
+            // format on sources without standalone audio. -x then extracts
+            // losslessly into a container matching the source codec (opus,
+            // m4a, ogg, ...), all accepted by the host's media scanner
+            // (which does not accept .webm), and guarantees no video is
+            // ever downloaded.
+            return new List<string> { "-x", "--embed-metadata" };
         }
 
         return new List<string>
         {
-            "-f", "ba/b", "-x",
+            "-x",
             "--audio-format", formatName,
             "--audio-quality", "0", // 0 = best
             "--embed-metadata"

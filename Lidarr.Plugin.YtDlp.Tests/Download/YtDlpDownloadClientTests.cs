@@ -148,6 +148,24 @@ public class YtDlpDownloadClientTests
             string.Join("|", client.GetItems().Select(i => $"{i.DownloadId}:{i.Status}:{i.Message}")));
     }
 
+    private static async Task<DownloadClientItem> WaitFor(
+        Func<DownloadClientItem?> predicate, int timeoutMs = 15000)
+    {
+        var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+        while (DateTime.UtcNow < deadline)
+        {
+            var item = predicate();
+            if (item != null)
+            {
+                return item;
+            }
+
+            await Task.Delay(25);
+        }
+
+        throw new TimeoutException("item never satisfied predicate");
+    }
+
     // ----- Download / GetItems -----
 
     [Test]
@@ -163,7 +181,7 @@ public class YtDlpDownloadClientTests
             Assert.That(item.Title, Is.EqualTo("Artist A - Song"), "host import parses this title");
             Assert.That(item.Status, Is.EqualTo(DownloadItemStatus.Completed));
             Assert.That(item.DownloadClientInfo.Protocol, Is.EqualTo(nameof(NzbDrone.Core.Indexers.YtDlpDownloadProtocol)));
-            Assert.That(item.DownloadClientInfo.Id, Is.EqualTo(3));
+            Assert.That(item.DownloadClientInfo.Id, Is.EqualTo(_client.Definition.Id));
             Assert.That(item.DownloadClientInfo.Name, Is.EqualTo("TestClient"));
             Assert.That(item.OutputPath.FullPath, Is.EqualTo(Path.Combine(_root, "Artist A - Song")));
             Assert.That(Directory.Exists(Path.Combine(_root, "Artist A - Song")), Is.True);
@@ -245,6 +263,112 @@ public class YtDlpDownloadClientTests
         var item = await WaitFor(_client, id, DownloadItemStatus.Failed);
         Assert.That(item.Message, Does.Contain("exited with code 1"));
         Assert.That(item.Message, Does.Contain("Signature extraction failed"));
+    }
+
+    [Test]
+    public async Task GetItems_reports_file_size_and_eta_while_downloading()
+    {
+        // The host queue UI renders progress as 100 - sizeleft/size, so the
+        // item must carry non-zero TotalSize while downloading or no progress
+        // bar is shown at all.
+        _fake.StreamLines.Clear();
+        // Current yt-dlp writes progress lines to STDOUT (older builds:
+        // stderr); the downloader must feed the parser from both streams.
+        _fake.StreamLines.Enqueue(("[download] Destination: /tmp/Song.opus", null));
+        _fake.StreamLines.Enqueue(("[download]  50.0% of ~ 2.00MiB at 1.00MiB/s ETA 00:05", null));
+        _fake.StreamLineDelayMs = 600; // > the 500ms progress throttle
+
+        var hold = new TaskCompletionSource();
+        _fake.StreamHold = hold;
+
+        var id = await _client.Download(RemoteAlbum(), Substitute.For<IIndexer>());
+
+        var item = await WaitFor(() =>
+        {
+            var candidate = _client.GetItems().FirstOrDefault(x => x.DownloadId == id);
+            return candidate is { Status: DownloadItemStatus.Downloading, TotalSize: > 0 } ? candidate : null;
+        });
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(item!.Status, Is.EqualTo(DownloadItemStatus.Downloading));
+            Assert.That(item.TotalSize, Is.EqualTo(2L * 1024 * 1024));
+            Assert.That(item.RemainingSize, Is.EqualTo(2L * 1024 * 1024 / 2).Within(2L * 1024));
+            Assert.That(item.RemainingTime, Is.EqualTo(TimeSpan.FromSeconds(5)));
+        });
+
+        hold.SetResult();
+        _ = await WaitFor(_client, id, DownloadItemStatus.Completed);
+    }
+
+    [Test]
+    public async Task Active_download_nudges_host_queue_refresh_and_stops_when_terminal()
+    {
+        // The host's scheduled tracked-download refresh runs on a ~1 minute
+        // cadence, so without nudges the activity queue would show no progress
+        // for downloads shorter than that. While a job is active the client
+        // must push the host's RefreshMonitoredDownloadsCommand, and stop once
+        // the job goes terminal.
+        var commandQueue = Substitute.For<NzbDrone.Core.Messaging.Commands.IManageCommandQueue>();
+        var client = new YtDlpDownloadClient(
+            Substitute.For<IConfigService>(),
+            _diskProvider,
+            Substitute.For<IRemotePathMappingService>(),
+            Substitute.For<ILocalizationService>(),
+            LogManager.GetLogger("test"),
+            commandQueue)
+        {
+            NudgeIntervalOverride = TimeSpan.FromMilliseconds(50)
+        };
+        client.Definition = new DownloadClientDefinition
+        {
+            Id = Interlocked.Increment(ref _nextDefinitionId),
+            Name = "NudgeClient",
+            Settings = new YtDlpClientSettings
+            {
+                YtDlpPath = "yt-dlp",
+                DownloadPath = _root,
+                MinDownloadDelaySeconds = 0,
+                MaxDownloadDelaySeconds = 0
+            }
+        };
+
+        _fake.StreamLines.Clear();
+        _fake.StreamLines.Enqueue(("[download] Destination: /tmp/Song.opus", null));
+
+        var hold = new TaskCompletionSource();
+        _fake.StreamHold = hold;
+
+        var id = await client.Download(RemoteAlbum(), Substitute.For<IIndexer>());
+
+        int NudgeCount()
+        {
+            return commandQueue.ReceivedCalls()
+                .Count(c => c.GetMethodInfo().Name == "Push"
+                            && c.GetArguments().Length >= 2
+                            && c.GetArguments()[0] is NzbDrone.Core.Download.RefreshMonitoredDownloadsCommand
+                            && Equals(c.GetArguments()[1], NzbDrone.Core.Messaging.Commands.CommandPriority.High));
+        }
+
+        var deadline = DateTime.UtcNow.AddSeconds(5);
+        while (NudgeCount() < 2 && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(25);
+        }
+
+        Assert.That(NudgeCount(), Is.GreaterThanOrEqualTo(2),
+            "expected repeated queue-refresh nudges while the download is in flight");
+
+        hold.SetResult();
+        _ = await WaitFor(client, id, DownloadItemStatus.Completed);
+
+        // Give the nudge loop a couple of ticks to observe the terminal state.
+        await Task.Delay(300);
+        var afterTerminal = NudgeCount();
+        await Task.Delay(300);
+
+        Assert.That(NudgeCount(), Is.EqualTo(afterTerminal),
+            "nudges must stop once the job is terminal");
     }
 
     // ----- host instance-transient behavior (SharedClientState) -----

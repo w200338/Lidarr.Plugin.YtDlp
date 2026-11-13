@@ -35,7 +35,7 @@ Requires:
 - `docs/` — research notes (`docs/research/`) and implementation plans
   (`docs/plans/`, one per phase, each with a STATUS line)
 - `Lidarr.Plugin.YtDlp/` — plugin source (net8.0, C# 12)
-- `Lidarr.Plugin.YtDlp.Tests/` — NUnit 3 + NSubstitute tests (220 tests)
+- `Lidarr.Plugin.YtDlp.Tests/` — NUnit 3 + NSubstitute tests (225 tests)
 - `ext/Lidarr` — git submodule pinned to tag `v3.1.6.5079` (host source;
   compile-time contract only, `Private=false`, never shipped)
 - `tools/zip-packager/` — tiny helper that builds the release zip

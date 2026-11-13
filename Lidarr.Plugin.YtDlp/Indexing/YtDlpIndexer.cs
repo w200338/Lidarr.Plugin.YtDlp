@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using FluentValidation.Results;
 using NLog;
 using NzbDrone.Common.Http;
@@ -53,8 +54,19 @@ public class YtDlpIndexer : IndexerBase<YtDlpIndexerSettings>
     /// <summary>Bounded timeout for the settings Test() connection check.</summary>
     private static readonly TimeSpan TestTimeout = TimeSpan.FromSeconds(90);
 
-    /// <summary>Bounded timeout per entry inspection (flat title resolve).</summary>
-    private static readonly TimeSpan InspectTimeout = TimeSpan.FromSeconds(30);
+    /// <summary>
+    /// Bounded timeout per entry inspection (flat title resolve). Generous
+    /// enough for slow networks; --socket-timeout 20 in the inspect args
+    /// makes hung sockets fail earlier than this backstop.
+    /// </summary>
+    private static readonly TimeSpan InspectTimeout = TimeSpan.FromSeconds(60);
+
+    /// <summary>
+    /// How many entry inspections may run at once. Flat metadata fetches are
+    /// light (no media), so a little overlap keeps search snappy; downloads
+    /// remain strictly serialized by the download client's scheduler.
+    /// </summary>
+    private const int InspectConcurrency = 3;
 
     private readonly YtDlpCommandBuilder _builder = new();
     private readonly SemaphoreSlim _searchGate = new(1, 1);
@@ -169,7 +181,7 @@ public class YtDlpIndexer : IndexerBase<YtDlpIndexerSettings>
     private async Task<IList<ReleaseInfo>> FetchAlbumReleasesAsync(string query, string artist, string? albumHint)
     {
         IReadOnlyList<SearchEntry> entries = [];
-        var resolutions = new Dictionary<string, EntryResolution>();
+        var resolutions = new ConcurrentDictionary<string, EntryResolution>();
 
         await _searchGate.WaitAsync().ConfigureAwait(false);
         try
@@ -189,14 +201,27 @@ public class YtDlpIndexer : IndexerBase<YtDlpIndexerSettings>
                 .Where(e => !string.IsNullOrEmpty(e.Id) && !string.IsNullOrWhiteSpace(e.Url))
                 .ToList();
 
-            foreach (var entry in entries)
+            // Resolve titles for all entries with bounded overlap: a slow or
+            // throttled single entry no longer stalls the whole search, and
+            // one hung entry costs at most InspectTimeout instead of
+            // InspectTimeout x N (the old serial loop).
+            using var inspectGate = new SemaphoreSlim(InspectConcurrency, InspectConcurrency);
+            await Task.WhenAll(entries.Select(async entry =>
             {
-                var resolved = await ResolveEntryAsync(entry.Url).ConfigureAwait(false);
-                if (resolved != null)
+                await inspectGate.WaitAsync().ConfigureAwait(false);
+                try
                 {
-                    resolutions[entry.Id] = resolved;
+                    var resolved = await ResolveEntryAsync(entry.Url).ConfigureAwait(false);
+                    if (resolved != null)
+                    {
+                        resolutions[entry.Id] = resolved;
+                    }
                 }
-            }
+                finally
+                {
+                    inspectGate.Release();
+                }
+            })).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -210,7 +235,7 @@ public class YtDlpIndexer : IndexerBase<YtDlpIndexerSettings>
 
         var releases = entries
             .Select(entry => MapAlbumRelease(entry, artist, albumHint, query,
-                resolutions.TryGetValue(entry.Id, out var resolved) ? resolved : null))
+                resolutions.TryGetValue(entry.Id, out var resolved) ? resolved : (EntryResolution?)null))
             .Where(r => r != null)
             .ToList();
 

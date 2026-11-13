@@ -66,28 +66,36 @@ public sealed class YtDlpAlbumDownloader
                 Path.Combine(outputPath, ".ytdlp-archive-" + album.Id + ".txt"), options);
 
         var parser = new YtDlpProgressParser();
-        var stderrTail = new Queue<string>(StdErrTailLines);
+        var lineTail = new Queue<string>(StdErrTailLines);
         var lastUpdate = DateTime.MinValue;
+
+        // Current yt-dlp versions write everything — including the [download]
+        // progress lines — to STDOUT, while older builds used stderr. Feed the
+        // parser from both streams (the regexes are prefix-anchored, so
+        // cross-stream lines are harmless) and keep a tail of both for error
+        // messages.
+        void HandleLine(string line)
+        {
+            lineTail.Enqueue(line);
+            while (lineTail.Count > StdErrTailLines)
+            {
+                lineTail.Dequeue();
+            }
+
+            if (parser.Feed(line) && DateTime.UtcNow - lastUpdate >= ProgressThrottle)
+            {
+                state.UpdateProgress(parser.AlbumPercent(totalTracks), parser.CurrentTrack,
+                    parser.CurrentFileTotalBytes, parser.CurrentFileRemainingBytes, parser.CurrentTrackEta);
+                lastUpdate = DateTime.UtcNow;
+            }
+        }
 
         YtDlpRunResult result;
         try
         {
             result = await _runner.RunStreamingAsync(args, new YtDlpStreamHandlers(
-                    _ => { },
-                    line =>
-                    {
-                        stderrTail.Enqueue(line);
-                        while (stderrTail.Count > StdErrTailLines)
-                        {
-                            stderrTail.Dequeue();
-                        }
-
-                        if (parser.Feed(line) && DateTime.UtcNow - lastUpdate >= ProgressThrottle)
-                        {
-                            state.UpdateProgress(parser.AlbumPercent(totalTracks), parser.CurrentTrack);
-                            lastUpdate = DateTime.UtcNow;
-                        }
-                    }),
+                    line => HandleLine(line),
+                    line => HandleLine(line)),
                 ct).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
@@ -100,7 +108,8 @@ public sealed class YtDlpAlbumDownloader
         }
 
         // Final un-throttled sync of parser state into the state object.
-        state.UpdateProgress(parser.AlbumPercent(totalTracks), parser.CurrentTrack);
+        state.UpdateProgress(parser.AlbumPercent(totalTracks), parser.CurrentTrack,
+            parser.CurrentFileTotalBytes, parser.CurrentFileRemainingBytes, parser.CurrentTrackEta);
 
         if (result.ExitCode == 0)
         {
@@ -108,7 +117,7 @@ public sealed class YtDlpAlbumDownloader
             return YtDlpDownloadOutcome.Completed;
         }
 
-        var message = string.Join(Environment.NewLine, stderrTail).Trim();
+        var message = string.Join(Environment.NewLine, lineTail).Trim();
         if (message.Length > ErrorMaxChars)
         {
             message = message[^ErrorMaxChars..];

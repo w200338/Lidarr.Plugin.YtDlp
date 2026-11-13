@@ -300,13 +300,16 @@ public class PackagingTests
             Substitute.For<IParsingService>(),
             logger);
 
+        // The command queue parameter is optional (null here = no queue
+        // refresh nudges); the host injects its own IManageCommandQueue.
         var client = Activator.CreateInstance(
             asm.GetType("Lidarr.Plugin.YtDlp.Download.YtDlpDownloadClient")!,
             Substitute.For<IConfigService>(),
             Substitute.For<NzbDrone.Common.Disk.IDiskProvider>(),
             Substitute.For<NzbDrone.Core.RemotePathMappings.IRemotePathMappingService>(),
             Substitute.For<NzbDrone.Core.Localization.ILocalizationService>(),
-            logger);
+            logger,
+            null);
 
         Assert.Multiple(() =>
         {

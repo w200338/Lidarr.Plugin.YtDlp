@@ -41,6 +41,16 @@ public sealed class FakeYtDlpRunner : IYtDlpRunner
     /// <summary>When set, streaming calls await this before emitting lines (to hold a job in-flight).</summary>
     public TaskCompletionSource? StreamBlock { get; set; }
 
+    /// <summary>
+    /// When set, the streaming call awaits this AFTER emitting all lines but
+    /// before returning — holds the job in the downloading state with the
+    /// fed progress lines already applied.
+    /// </summary>
+    public TaskCompletionSource? StreamHold { get; set; }
+
+    /// <summary>Milliseconds to wait after each emitted line (0 = none).</summary>
+    public int StreamLineDelayMs { get; set; }
+
     /// <summary>Incremented when a streaming call reaches the point where it starts emitting lines.</summary>
     public int StreamStarted { get; private set; }
 
@@ -93,7 +103,25 @@ public sealed class FakeYtDlpRunner : IYtDlpRunner
                 handlers.OnStdErrLine(errLine);
             }
 
+            if (StreamLineDelayMs > 0)
+            {
+                await Task.Delay(StreamLineDelayMs).ConfigureAwait(false);
+            }
+
             ct.ThrowIfCancellationRequested();
+        }
+
+        if (StreamHold != null)
+        {
+            using var reg = ct.Register(() => StreamHold.TrySetCanceled(ct));
+            try
+            {
+                await StreamHold.Task.ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                throw new OperationCanceledException(ct);
+            }
         }
 
         await Task.Yield();

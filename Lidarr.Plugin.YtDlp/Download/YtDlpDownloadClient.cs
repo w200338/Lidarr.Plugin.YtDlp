@@ -7,6 +7,7 @@ using NzbDrone.Core.Download;
 using NzbDrone.Core.Exceptions;
 using NzbDrone.Core.Indexers;
 using NzbDrone.Core.Localization;
+using NzbDrone.Core.Messaging.Commands;
 using NzbDrone.Core.Parser.Model;
 using NzbDrone.Core.RemotePathMappings;
 using NzbDrone.Core.Validation;
@@ -45,6 +46,20 @@ public class YtDlpDownloadClient : DownloadClientBase<YtDlpClientSettings>
     /// <summary>Terminal items stay visible this long so the host can read the outcome.</summary>
     private static readonly TimeSpan TerminalGracePeriod = TimeSpan.FromMinutes(5);
 
+    /// <summary>
+    /// The host's scheduled tracked-download refresh runs on a ~1 minute
+    /// (up to ~90s) cadence, which is far too slow to show in-flight download
+    /// progress on the activity queue. While a job is not terminal we push the
+    /// host's own RefreshMonitoredDownloadsCommand every NudgeInterval so the
+    /// queue row (size / sizeleft / timeleft / track) tracks the download.
+    /// Pushes are deduplicated by the host command queue when a refresh is
+    /// already queued or running.
+    /// </summary>
+    private static readonly TimeSpan DefaultNudgeInterval = TimeSpan.FromSeconds(5);
+
+    /// <summary>Safety cap for the nudge loop (a job should never live this long).</summary>
+    private static readonly TimeSpan NudgeMaxLifetime = TimeSpan.FromMinutes(60);
+
     // Job state is shared per client definition id, NOT held on the instance:
     // the host resolves provider instances by concrete type and registers
     // concrete plugin types as TRANSIENT, so every host call may hit a fresh
@@ -65,15 +80,24 @@ public class YtDlpDownloadClient : DownloadClientBase<YtDlpClientSettings>
         }
     }
 
+    /// <summary>Test seam: override the queue-refresh nudge interval (null → default).</summary>
+    internal TimeSpan? NudgeIntervalOverride { get; set; }
+
+    private TimeSpan NudgeInterval => NudgeIntervalOverride ?? DefaultNudgeInterval;
+
     public YtDlpDownloadClient(
         IConfigService configService,
         IDiskProvider diskProvider,
         IRemotePathMappingService remotePathMappingService,
         ILocalizationService localizationService,
-        Logger logger)
+        Logger logger,
+        IManageCommandQueue? commandQueue = null)
         : base(configService, diskProvider, remotePathMappingService, localizationService, logger)
     {
+        _commandQueue = commandQueue;
     }
+
+    private readonly IManageCommandQueue? _commandQueue;
 
     public override string Name => "YouTube (yt-dlp)";
 
@@ -121,6 +145,7 @@ public class YtDlpDownloadClient : DownloadClientBase<YtDlpClientSettings>
     {
         var now = DateTime.UtcNow;
         var jobs = State.Jobs;
+
         var items = jobs.Values
             .Where(j => !j.IsCompleted
                         || (j.CompletedAt.HasValue && now - j.CompletedAt.Value < TerminalGracePeriod))
@@ -264,6 +289,8 @@ public class YtDlpDownloadClient : DownloadClientBase<YtDlpClientSettings>
             });
             scheduler.Start();
 
+            StartQueueRefreshNudge(state);
+
             return state.Id;
         }
     }
@@ -298,8 +325,13 @@ public class YtDlpDownloadClient : DownloadClientBase<YtDlpClientSettings>
             DownloadId = job.Id,
             Category = string.Empty,
             Title = job.Title,
-            TotalSize = 0,
-            RemainingSize = 0,
+            // The host queue UI renders progress as 100 - sizeleft/size, so we
+            // report the current file's byte window while downloading (the bar
+            // fills per track and the status message names the track). 0/0
+            // for queued/terminal items keeps the bar hidden there.
+            TotalSize = job.IsCompleted || job.Status == YtDlpJobStatus.Queued ? 0 : job.CurrentFileTotalBytes,
+            RemainingSize = job.IsCompleted || job.Status == YtDlpJobStatus.Queued ? 0 : job.CurrentFileRemainingBytes,
+            RemainingTime = job.IsCompleted || job.Status != YtDlpJobStatus.Downloading ? null : job.CurrentTrackEta,
             OutputPath = new OsPath(job.OutputPath),
             Message = job.Status switch
             {
@@ -374,5 +406,58 @@ public class YtDlpDownloadClient : DownloadClientBase<YtDlpClientSettings>
                 jobs.TryRemove(job.Id, out _);
             }
         }
+    }
+
+    /// <summary>
+    /// Nudge the host to refresh its tracked-download snapshot while a job is
+    /// queued/downloading, so the activity queue shows live progress instead of
+    /// waiting for the host's ~1 minute scheduled refresh. Fire-and-forget:
+    /// the loop ends when the job goes terminal, is removed, or the cap is hit.
+    /// </summary>
+    private void StartQueueRefreshNudge(DownloadJobState job)
+    {
+        if (_commandQueue == null)
+        {
+            return;
+        }
+
+        var interval = NudgeInterval;
+
+        _ = Task.Run(async () =>
+        {
+            var started = DateTime.UtcNow;
+
+            try
+            {
+                while (DateTime.UtcNow - started < NudgeMaxLifetime)
+                {
+                    await Task.Delay(interval).ConfigureAwait(false);
+
+                    if (job.IsCompleted)
+                    {
+                        return;
+                    }
+
+                    if (!State.Jobs.ContainsKey(job.Id))
+                    {
+                        return; // removed via RemoveItem
+                    }
+
+                    try
+                    {
+                        _commandQueue.Push(new RefreshMonitoredDownloadsCommand(), CommandPriority.High);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.Debug("[YtDlpDownloadClient] Queue refresh nudge failed: {0}", ex.Message);
+                        return;
+                    }
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // process shutdown
+            }
+        }, CancellationToken.None);
     }
 }
