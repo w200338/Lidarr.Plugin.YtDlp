@@ -1,7 +1,9 @@
 # PHASE 7 — Port to the native Lidarr plugin model + release pipeline
 
 ```
-STATUS: v0.2.4 IMPLEMENTED (2026-11-13) — tests 245/245 green Debug+Release,
+STATUS: COMPLETED (2026-11-13) — v0.2.4 shipped and user-confirmed working on
+        the live v3.1.6.5079 host (age/size/quality/search-limit/settings
+        fixes all verified). Tests 245/245 green Debug+Release,
         Release artifact rebuilt. Fixes the five v0.2.3 field reports:
         (1) indexer age 0 minutes → PublishDate = Dec 31 of the catalog
         AlbumYear (host-provided via AlbumSearchCriteria), (2) indexer size
@@ -21,9 +23,12 @@ STATUS: v0.2.4 IMPLEMENTED (2026-11-13) — tests 245/245 green Debug+Release,
         DONE (user-confirmed 2026-11-13): force push of the rewritten history
         to GitLab; GitHub push-mirror configured (commits AND tags).
         DO NOT re-request the push or the mirror setup — they are done.
-        REMAINING (user side): tag v0.2.4 on GitLab (pipeline → release with
-        net8.0.zip → mirrored to GitHub), install/update on the user's host
-        (expect 0.2.4.0), live validation. Debug history for the progress
+        DONE (user-confirmed 2026-11-13): v0.2.4 tagged/released/installed and
+        live-validated on the user's host; the orphaned Tubifarry provider
+        rows were cleaned from lidarr.db with the verified SQL (12 rows: 10
+        Metadata + YouTubeIndexerSettings indexer + YoutubeProviderSettings
+        client) and the 'Skipping provider of unknown type' warnings are gone.
+        NOTHING REMAINS on the user side. Debug history for the progress
         fix: docs/research/08-live-queue-progress-debug.md.
 REQUIRES: user confirmation (direction already expressed: stay on stable host,
           GitHub mirror OK, GitLab release required)
@@ -205,7 +210,7 @@ New namespace `Lidarr.Plugin.YtDlp.Native` (or root):
       `/var/lib/lidarr/plugins/w200338/lidarr-plugin-ytdlp/`); settings table;
       "how the host finds the plugin" section; troubleshooting (restart modal,
       `Skipping provider of unknown type` = stale Tubifarry rows).
-- [ ] This plan → `STATUS: COMPLETED` with implementation notes.
+- [x] This plan → `STATUS: COMPLETED` with implementation notes.
 
 ## Step 7 — Verification (with the user's host)
 
@@ -570,3 +575,10 @@ causes, verification, and remediation:
 
 Status: 245/245 green Debug + Release; Release artifact rebuilt
 (`artifacts/net8.0.zip`).
+
+**FINAL (user-confirmed 2026-11-13): v0.2.4 is deployed and working on the
+user's v3.1.6.5079 host.** All five field reports are resolved, and the
+orphaned Tubifarry provider rows (12: ten `Metadata` rows, `Indexers` id 8
+`YouTubeIndexerSettings`, `DownloadClients` id 4 `YoutubeProviderSettings`)
+were deleted with the verified SQL from the research doc — the provider
+warnings no longer appear. Project complete.
