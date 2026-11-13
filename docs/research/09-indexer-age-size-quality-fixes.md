@@ -308,7 +308,8 @@ is affected; the warnings are noise on startup and on provider queries.
      SELECT Id, Name, ConfigContract FROM Metadata        WHERE ConfigContract NOT IN
         ('XbmcMetadataSettings','WdtvMetadataSettings','RoksboxMetadataSettings');
      SELECT Id, Name, ConfigContract FROM Indexers        WHERE ConfigContract NOT IN
-        ('HeadphonesSettings','IPTorrentsSettings','GazelleSettings','YtDlpIndexerSettings');
+        ('HeadphonesSettings','IPTorrentsSettings','GazelleSettings',
+         'NewznabSettings','TorznabSettings','YtDlpIndexerSettings');
      SELECT Id, Name, ConfigContract FROM DownloadClients WHERE ConfigContract NOT IN
         ('Aria2Settings','DelugeSettings','DownloadStationSettings','FloodClientSettings','FloodSettings',
          'FreeboxDownloadSettings','HadoukenSettings','NzbVortexSettings','NzbgetSettings','PneumaticSettings',
