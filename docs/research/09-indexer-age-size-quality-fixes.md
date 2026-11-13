@@ -276,26 +276,87 @@ is affected; the warnings are noise on startup and on provider queries.
    `Settings → Plugins` — the types resolve again and the warnings stop.
 2. **If you don't:** delete the orphaned provider entries.
    - Preferred: Lidarr UI → `Settings → Indexers / Download Clients /
-     Import Lists / Notifications` and delete anything you don't use
-     (orphaned rows whose type can't be resolved usually *can't* be shown
-     or edited in the UI, which is why step 3 may be needed).
-   - Nuclear, precise: with Lidarr **stopped**, in `lidarr.db` delete the
-     rows whose `ConfigContract` names one of the four unknown types:
+     Import Lists / Metadata / Notifications` and delete anything you
+     don't use (orphaned rows whose type can't be resolved usually
+     *can't* be shown or edited in the UI, which is why the DB step may
+     be needed).
+   - Precise DB cleanup (verified against the `v3.1.6.5079` schema):
+     with Lidarr **stopped** and a **backup of `lidarr.db` taken**, run
+     in `sqlite3` (or any SQLite client):
+
+     *Step 1 — see every provider row you have* (five tables carry
+     provider definitions in this version; there is no single generic
+     `Providers` table):
+
      ```sql
-     -- inspect first
-     SELECT Id, Name, ConfigContract FROM Indexers        WHERE ConfigContract IN
-        ('MixedMetadataProxySettings','SykHookMetadataProxySettings','SearchSniperTaskSettings','LastfmMetadataProxySettings');
-     SELECT Id, Name, ConfigContract FROM DownloadClients WHERE ConfigContract IN
-        ('MixedMetadataProxySettings','SykHookMetadataProxySettings','SearchSniperTaskSettings','LastfmMetadataProxySettings');
-     SELECT Id, Name, ConfigContract FROM ImportLists     WHERE ConfigContract IN
-        ('MixedMetadataProxySettings','SykHookMetadataProxySettings','SearchSniperTaskSettings','LastfmMetadataProxySettings');
-     SELECT Id, Name, ConfigContract FROM Notifications   WHERE ConfigContract IN
-        ('MixedMetadataProxySettings','SykHookMetadataProxySettings','SearchSniperTaskSettings','LastfmMetadataProxySettings');
-     -- then delete the matching rows from the tables they appear in
+     SELECT 'Metadata' AS Table, Id, Name, ConfigContract FROM Metadata
+     UNION ALL SELECT 'Indexers', Id, Name, ConfigContract FROM Indexers
+     UNION ALL SELECT 'DownloadClients', Id, Name, ConfigContract FROM DownloadClients
+     UNION ALL SELECT 'ImportLists', Id, Name, ConfigContract FROM ImportLists
+     UNION ALL SELECT 'Notifications', Id, Name, ConfigContract FROM Notifications
+     ORDER BY Table, Id;
      ```
-     Take a backup of `lidarr.db` first. (The provider tables in this
-     version are `Indexers`, `DownloadClients`, `ImportLists`,
-     `Notifications` — there is no single generic `Providers` table.)
+
+     *Step 2 — flag every row whose settings type is NOT a built-in
+     Lidarr v3.1.6.5079 provider (and not your YtDlp plugin's).*
+     Anything this returns is an orphan from an uninstalled plugin —
+     in a typical Tubifarry install it is exactly the ten metadata rows
+     below. (Verified: on a reference `v3.1.6.5079` DB this flags the
+     ten Tubifarry `Metadata` rows and nothing else.)
+
+     ```sql
+     SELECT Id, Name, ConfigContract FROM Metadata        WHERE ConfigContract NOT IN
+        ('XbmcMetadataSettings','WdtvMetadataSettings','RoksboxMetadataSettings');
+     SELECT Id, Name, ConfigContract FROM Indexers        WHERE ConfigContract NOT IN
+        ('HeadphonesSettings','IPTorrentsSettings','GazelleSettings','YtDlpIndexerSettings');
+     SELECT Id, Name, ConfigContract FROM DownloadClients WHERE ConfigContract NOT IN
+        ('Aria2Settings','DelugeSettings','DownloadStationSettings','FloodClientSettings','FloodSettings',
+         'FreeboxDownloadSettings','HadoukenSettings','NzbVortexSettings','NzbgetSettings','PneumaticSettings',
+         'QBittorrentSettings','RTorrentSettings','SabnzbdSettings','TorrentBlackholeSettings','TransmissionSettings',
+         'UTorrentSettings','UsenetBlackholeSettings','YtDlpClientSettings');
+     SELECT Id, Name, ConfigContract FROM ImportLists     WHERE ConfigContract NOT IN
+        ('CustomSettings','HeadphonesImportSettings','LastFmTagSettings','LastFmUserSettings',
+         'LidarrListsSettings','LidarrSettings','MusicBrainzSeriesSettings',
+         'SpotifyFollowedArtistsSettings','SpotifyPlaylistSettings','SpotifySavedAlbumsSettings');
+     SELECT Id, Name, ConfigContract FROM Notifications   WHERE ConfigContract NOT IN
+        ('AppriseSettings','CustomScriptSettings','DiscordSettings','EmailSettings','GotifySettings','JoinSettings',
+         'MailgunSettings','MediaBrowserSettings','NotifiarrSettings','NtfySettings','PlexServerSettings','ProwlSettings',
+         'PushBulletSettings','PushcutSettings','PushoverSettings','SendGridSettings','SignalSettings',
+         'SimplepushSettings','SlackSettings','SubsonicSettings','SynologyIndexerSettings','TelegramSettings',
+         'TwitterSettings','WebhookSettings','XbmcSettings');
+     ```
+
+     *Step 3 — targeted delete* (only after Steps 1–2 look right). In a
+     Tubifarry install every orphan is in `Metadata`; the ten known
+     Tubifarry contracts are:
+
+     ```sql
+     DELETE FROM Metadata WHERE ConfigContract IN
+        ('SearchSniperTaskSettings','SimilarArtistsProxySettings','SykHookMetadataProxySettings',
+         'MixedMetadataProxySettings','LastfmMetadataProxySettings','DiscogsMetadataProxySettings',
+         'DeezerMetadataProxySettings','CustomLidarrMetadataProxySettings','LyricsEnhancerSettings',
+         'AudioConverterSettings');
+     -- if Step 2 flagged rows in other tables too, delete those the same way:
+     -- DELETE FROM Indexers        WHERE ConfigContract IN (...flagged names...);
+     -- DELETE FROM DownloadClients WHERE ConfigContract IN (...flagged names...);
+     -- DELETE FROM ImportLists     WHERE ConfigContract IN (...flagged names...);
+     -- DELETE FROM Notifications   WHERE ConfigContract IN (...flagged names...);
+     ```
+
+     Safety notes, verified against the `v3.1.6.5079` source and a
+     reference DB:
+     - The rows are named deceptively: **"Lidarr Default"** is
+       Tubifarry's SykHook proxy and **"Lidarr Custom"** is its
+       CustomLidarrMetadataProxy — neither is a Lidarr built-in. The
+       real built-in metadata providers are only Kodi (XBMC), WDTV and
+       Roku Box (`XbmcMetadataSettings` / `WdtvMetadataSettings` /
+       `RoksboxMetadataSettings`).
+     - Metadata profiles in this version do **not** store metadata
+       provider ids (they only hold album-type/status filters), so
+       deleting `Metadata` rows leaves no dangling references.
+     - `YtDlpIndexerSettings` / `YtDlpClientSettings` are deliberately
+       whitelisted in Step 2 so your own plugin's providers are never
+       flagged.
 
 ---
 
