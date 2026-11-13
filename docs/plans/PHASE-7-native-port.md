@@ -5,8 +5,14 @@ STATUS: v0.2.3 IMPLEMENTED + LOCALLY VERIFIED (2026-11-13) — code, tests
         (225/225), packaging, CI + docs all done; live E2E on the official
         v3.1.6.5079 host (search → grab → download → import) including the
         queue-refresh nudge that makes the activity queue show live progress.
-        REMAINING (user side): push commits to GitLab, set up the GitHub
-        push-mirror, tag v0.2.3, and live validation on the user's host.
+        DONE (user-confirmed 2026-11-13): force push of the rewritten history
+        to GitLab; GitHub push-mirror configured (commits AND tags).
+        DO NOT re-request the push or the mirror setup — they are done.
+        REMAINING (user side): tag v0.2.3 on GitLab (pipeline → release with
+        net8.0.zip → mirrored to GitHub), install/update on the user's host
+        (expect 0.2.3.0), live validation (queue progress, search, delay
+        profile). Debug history for the progress fix:
+        docs/research/08-live-queue-progress-debug.md.
 REQUIRES: user confirmation (direction already expressed: stay on stable host,
           GitHub mirror OK, GitLab release required)
 RESEARCH: docs/research/07-native-model-port.md (contracts + packaging recipe)
