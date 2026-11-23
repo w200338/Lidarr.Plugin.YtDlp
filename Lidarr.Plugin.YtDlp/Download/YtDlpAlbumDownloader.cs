@@ -117,6 +117,30 @@ public sealed class YtDlpAlbumDownloader
             return YtDlpDownloadOutcome.Completed;
         }
 
+        // Non-zero exit: combine both streams into trimmed, non-empty lines and
+        // parse the errors yt-dlp reported.
+        var outputLines = result.StandardOutput
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            .Concat(result.StandardError.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+            .Select(line => line.Trim())
+            .Where(line => line.Length > 0)
+            .ToList();
+        var errors = YtDlpErrorSummary.Parse(outputLines);
+
+        // Partial-success branch: a multi-item album (playlist/browse) that
+        // downloaded at least one track. Unless strict mode (FailOnPartial) is
+        // set, mark the job completed so the host auto-imports the tracks that
+        // exist; the failed tracks are listed in the warning message. Single-
+        // track downloads fall through to the all-or-nothing failure path below.
+        if (album.Kind != YtDlpAlbumKind.SingleTrack && !_settings.FailOnPartial && parser.FilesCompleted > 0)
+        {
+            var total = totalTracks > 0 ? totalTracks.Value : parser.FilesStarted;
+            var partialMessage = BuildPartialWarningMessage(parser.FilesCompleted, total, errors);
+
+            state.MarkTerminal(YtDlpJobStatus.Completed, success: true, partialMessage);
+            return YtDlpDownloadOutcome.Completed;
+        }
+
         var message = string.Join(Environment.NewLine, lineTail).Trim();
         if (message.Length > ErrorMaxChars)
         {
@@ -179,4 +203,45 @@ public sealed class YtDlpAlbumDownloader
             return (false, null);
         }
     }
+
+    /// <summary>
+    /// Builds the warning message for a partial-success album download: how many
+    /// tracks downloaded out of the total, plus the failed tracks (id + message,
+    /// truncated) joined by "; ".
+    /// </summary>
+    /// <param name="filesCompleted">Number of tracks that downloaded fully.</param>
+    /// <param name="totalTracks">Total number of tracks in the album (0 when
+    /// unknown, in which case the downloader passes <c>FilesStarted</c>).</param>
+    /// <param name="errors">The parsed error summary for the failed tracks.</param>
+    /// <returns>The human-readable warning message.</returns>
+    private static string BuildPartialWarningMessage(int filesCompleted, int totalTracks, YtDlpErrorSummary errors)
+    {
+        var message = $"Completed with warnings - {filesCompleted} of {totalTracks} tracks downloaded";
+
+        if (errors.TotalErrors > 0)
+        {
+            var items = errors.Errors
+                .Select(e => e.VideoId is null
+                    ? Truncate(e.Message, 120)
+                    : $"{e.VideoId}: {Truncate(e.Message, 120)}");
+
+            message += ". Failed: " + string.Join("; ", items);
+
+            if (errors.TotalErrors > errors.Errors.Count)
+            {
+                message += $" (+{errors.TotalErrors - errors.Errors.Count} more)";
+            }
+        }
+
+        return errors.TotalErrors > 0 ? message : message + ".";
+    }
+
+    /// <summary>
+    /// Truncates <paramref name="value"/> to at most <paramref name="max"/> characters.
+    /// </summary>
+    /// <param name="value">The string to truncate (never <c>null</c> here).</param>
+    /// <param name="max">Maximum number of characters to keep.</param>
+    /// <returns><paramref name="value"/> when it fits, otherwise its first <paramref name="max"/> characters.</returns>
+    private static string Truncate(string value, int max) =>
+        value.Length <= max ? value : value[..max];
 }

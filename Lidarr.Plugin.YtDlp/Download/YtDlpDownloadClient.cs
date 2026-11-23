@@ -306,6 +306,14 @@ public class YtDlpDownloadClient : DownloadClientBase<YtDlpClientSettings>
         try
         {
             await downloader.DownloadAsync(state.Album, state.OutputPath, state, token).ConfigureAwait(false);
+
+            // A multi-item album can complete with warnings (partial success):
+            // the job is Completed but carries an ErrorMessage listing the
+            // failed tracks. Surface it in the logs.
+            if (state.Status == YtDlpJobStatus.Completed && state.ErrorMessage is not null)
+            {
+                _logger.Warn("[{0}] Job {1} completed with warnings: {2}", Name, state.Id, state.ErrorMessage);
+            }
         }
         catch (OperationCanceledException)
         {
@@ -340,7 +348,7 @@ public class YtDlpDownloadClient : DownloadClientBase<YtDlpClientSettings>
             {
                 YtDlpJobStatus.Queued => "Queued",
                 YtDlpJobStatus.Downloading => job.CurrentTrack is null ? "Downloading" : $"Downloading: {job.CurrentTrack}",
-                YtDlpJobStatus.Completed => "Completed",
+                YtDlpJobStatus.Completed => job.ErrorMessage is null ? "Completed" : job.ErrorMessage,
                 YtDlpJobStatus.Cancelled => "Canceled",
                 _ => job.ErrorMessage ?? "Failed"
             },

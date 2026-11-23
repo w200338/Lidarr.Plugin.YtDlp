@@ -3,6 +3,7 @@ using Lidarr.Plugin.YtDlp.Runner;
 using Lidarr.Plugin.YtDlp.Settings;
 using Lidarr.Plugin.YtDlp.Tests.Support;
 using NUnit.Framework;
+using System.Globalization;
 
 namespace Lidarr.Plugin.YtDlp.Tests.Download;
 
@@ -41,6 +42,20 @@ public class YtDlpAlbumDownloaderTests
         {
             // Parser sets CurrentTrack from "[download] Destination:" lines.
             fake.StreamLines.Enqueue((null, $"[download] Destination: /tmp/{track}.m4a"));
+        }
+    }
+
+    // Streams the progress that YtDlpProgressParser counts as 3 completed files:
+    // 100% (file 1), 50% (file 2 starts), 100% (file 2), 50% (file 3 starts),
+    // 100% (file 3). Progress on stdout, errors (in the calling test) on stderr,
+    // so both streams feed the partial-success error parser.
+    private static void FeedThreeCompletedFiles(FakeYtDlpRunner fake)
+    {
+        foreach (var percent in new[] { 100, 50, 100, 50, 100 })
+        {
+            fake.StreamLines.Enqueue((
+                "[download] " + percent.ToString(CultureInfo.InvariantCulture) + ".0% of 10.00KiB at 10.00KiB/s",
+                null));
         }
     }
 
@@ -175,6 +190,133 @@ public class YtDlpAlbumDownloaderTests
             Assert.That(state.ErrorMessage, Does.Contain("exited with code 1"));
             Assert.That(state.ErrorMessage, Does.Contain("bot check"));
             Assert.That(state.CompletedAt, Is.Not.Null);
+        });
+    }
+
+    // ----- partial success (multi-item album, non-zero exit) -----
+
+    private static readonly string[] TwoDeadPlaylistErrors =
+    {
+        "ERROR: [youtube] Knt8RVzBiuU: Video unavailable. This video is not available",
+        "ERROR: [youtube] Q4CVDlnLTtE: Video unavailable. This video is not available"
+    };
+
+    [Test]
+    public async Task Playlist_partialSuccess_nonZeroExit_completesWithWarning()
+    {
+        var fake = new FakeYtDlpRunner
+        {
+            BufferBehavior = (args, ct) => Task.FromResult(new YtDlpRunResult(0,
+                "{\"title\":\"Album\",\"playlist_count\":3}", string.Empty))
+        };
+        FeedThreeCompletedFiles(fake);
+        foreach (var error in TwoDeadPlaylistErrors)
+        {
+            fake.StreamLines.Enqueue((null, error));
+        }
+        fake.StreamExitCode = 1;
+
+        var dir = TempDir();
+        var state = State(new YtDlpAlbumRef(YtDlpAlbumKind.Playlist, Playlist), dir, "Artist - Album");
+        var downloader = new YtDlpAlbumDownloader(fake, Settings());
+
+        var outcome = await downloader.DownloadAsync(state.Album, dir, state, state.Cts.Token);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(outcome, Is.EqualTo(YtDlpDownloadOutcome.Completed));
+            Assert.That(state.Status, Is.EqualTo(YtDlpJobStatus.Completed));
+            Assert.That(state.Success, Is.True);
+            Assert.That(state.ErrorMessage, Does.Contain("Completed with warnings"));
+            Assert.That(state.ErrorMessage, Does.Contain("3 of 3"));
+            Assert.That(state.ErrorMessage, Does.Contain("Knt8RVzBiuU"));
+            Assert.That(state.ErrorMessage, Does.Contain("Q4CVDlnLTtE"));
+        });
+    }
+
+    [Test]
+    public async Task Playlist_partialSuccess_strictMode_fails()
+    {
+        var fake = new FakeYtDlpRunner
+        {
+            BufferBehavior = (args, ct) => Task.FromResult(new YtDlpRunResult(0,
+                "{\"title\":\"Album\",\"playlist_count\":3}", string.Empty))
+        };
+        FeedThreeCompletedFiles(fake);
+        foreach (var error in TwoDeadPlaylistErrors)
+        {
+            fake.StreamLines.Enqueue((null, error));
+        }
+        fake.StreamExitCode = 1;
+
+        var strictSettings = Settings();
+        strictSettings.FailOnPartial = true;
+
+        var dir = TempDir();
+        var state = State(new YtDlpAlbumRef(YtDlpAlbumKind.Playlist, Playlist), dir, "Artist - Album");
+        var downloader = new YtDlpAlbumDownloader(fake, strictSettings);
+
+        var outcome = await downloader.DownloadAsync(state.Album, dir, state, state.Cts.Token);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(outcome, Is.EqualTo(YtDlpDownloadOutcome.Failed));
+            Assert.That(state.Status, Is.EqualTo(YtDlpJobStatus.Failed));
+            Assert.That(state.Success, Is.False);
+        });
+    }
+
+    [Test]
+    public async Task SingleTrack_nonZeroExit_stillFails()
+    {
+        var fake = new FakeYtDlpRunner
+        {
+            BufferBehavior = (args, ct) => Task.FromResult(new YtDlpRunResult(0,
+                "{\"title\":\"Song\"}", string.Empty))
+        };
+        FeedCompletion(fake, 100, null); // one completed file
+        fake.StreamLines.Enqueue((null, "ERROR: [youtube] Knt8RVzBiuU: Video unavailable."));
+        fake.StreamExitCode = 1;
+
+        var dir = TempDir();
+        var state = State(new YtDlpAlbumRef(YtDlpAlbumKind.SingleTrack, SingleVideo), dir, "A - B");
+        var downloader = new YtDlpAlbumDownloader(fake, Settings());
+
+        var outcome = await downloader.DownloadAsync(state.Album, dir, state, state.Cts.Token);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(outcome, Is.EqualTo(YtDlpDownloadOutcome.Failed));
+            Assert.That(state.Status, Is.EqualTo(YtDlpJobStatus.Failed));
+            Assert.That(state.ErrorMessage, Does.Contain("exited with code 1"));
+        });
+    }
+
+    [Test]
+    public async Task Playlist_zeroFiles_nonZeroExit_fails()
+    {
+        var fake = new FakeYtDlpRunner
+        {
+            BufferBehavior = (args, ct) => Task.FromResult(new YtDlpRunResult(0,
+                "{\"title\":\"Album\",\"playlist_count\":3}", string.Empty))
+        };
+        // Only errors, no progress -> nothing downloaded.
+        foreach (var error in TwoDeadPlaylistErrors)
+        {
+            fake.StreamLines.Enqueue((null, error));
+        }
+        fake.StreamExitCode = 1;
+
+        var dir = TempDir();
+        var state = State(new YtDlpAlbumRef(YtDlpAlbumKind.Playlist, Playlist), dir, "Artist - Album");
+        var downloader = new YtDlpAlbumDownloader(fake, Settings());
+
+        var outcome = await downloader.DownloadAsync(state.Album, dir, state, state.Cts.Token);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(outcome, Is.EqualTo(YtDlpDownloadOutcome.Failed));
+            Assert.That(state.Status, Is.EqualTo(YtDlpJobStatus.Failed));
         });
     }
 

@@ -266,6 +266,34 @@ public class YtDlpDownloadClientTests
     }
 
     [Test]
+    public void Completed_job_with_warning_message_maps_to_item_message()
+    {
+        // A multi-item album can complete with warnings (partial success): the
+        // job is Completed but carries an ErrorMessage. MapItem must surface it
+        // as the item Message while keeping Status Completed (host imports it).
+        var warning = "Completed with warnings - 2 of 3 tracks downloaded. Failed: Knt8RVzBiuU: Video unavailable.";
+        var shared = SharedClientStates.For(_definitionId)!;
+        var job = new DownloadJobState
+        {
+            Id = "warn-job",
+            Album = new YtDlpAlbumRef(YtDlpAlbumKind.Playlist, "PL123"),
+            OutputPath = Path.Combine(_root, "Artist - Album"),
+            Title = "Artist - Album"
+        };
+        job.MarkTerminal(YtDlpJobStatus.Completed, success: true, warning);
+        shared.Jobs[job.Id] = job;
+
+        var item = _client.GetItems().FirstOrDefault(i => i.DownloadId == job.Id);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(item, Is.Not.Null, "completed-with-warning job stays visible");
+            Assert.That(item?.Status, Is.EqualTo(DownloadItemStatus.Completed));
+            Assert.That(item?.Message, Is.EqualTo(warning));
+        });
+    }
+
+    [Test]
     public async Task GetItems_reports_file_size_and_eta_while_downloading()
     {
         // The host queue UI renders progress as 100 - sizeleft/size, so the

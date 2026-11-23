@@ -90,16 +90,26 @@ public sealed class FakeYtDlpRunner : IYtDlpRunner
         Interlocked.Increment(ref _streamStarted);
         ct.ThrowIfCancellationRequested();
 
+        // Capture streamed lines so the result's StandardOutput/StandardError
+        // mirror production (CliWrapYtDlpRunner accumulates both streams). The
+        // partial-success branch of the downloader parses these for the failed
+        // tracks, so the streamed lines must reach the result, not just the
+        // parser.
+        var stdoutLines = new List<string>();
+        var stderrLines = new List<string>();
+
         while (StreamLines.Count > 0)
         {
             var (outLine, errLine) = StreamLines.Dequeue();
             if (outLine != null)
             {
+                stdoutLines.Add(outLine);
                 handlers.OnStdOutLine(outLine);
             }
 
             if (errLine != null)
             {
+                stderrLines.Add(errLine);
                 handlers.OnStdErrLine(errLine);
             }
 
@@ -125,7 +135,8 @@ public sealed class FakeYtDlpRunner : IYtDlpRunner
         }
 
         await Task.Yield();
-        return new YtDlpRunResult(StreamExitCode, string.Empty, string.Empty);
+        return new YtDlpRunResult(StreamExitCode,
+            string.Join("\n", stdoutLines), string.Join("\n", stderrLines));
     }
 
     private void RecordCall(IReadOnlyList<string> args)

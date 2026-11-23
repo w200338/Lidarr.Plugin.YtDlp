@@ -49,6 +49,10 @@ public class YtDlpClientSettings : YtDlpSettings, IProviderConfig, IEquatable<Yt
         HelpText = "Root folder for downloads. Lidarr imports files from per-artist/album subfolders here and can remove them after import.")]
     public string DownloadPath { get; set; } = string.Empty;
 
+    [FieldDefinition(8, Label = "Fail on Partial", Type = FieldType.Checkbox,
+        HelpText = "Strict mode: when true, any non-zero yt-dlp exit code fails the whole job even if some tracks downloaded (previous behavior). When false (default), a multi-item album that downloaded at least one track is marked completed with warnings so the host imports what succeeded.")]
+    public bool FailOnPartial { get; set; } = false;
+
     public NzbDroneValidationResult Validate() => new(Validator.Validate(this));
 
     public bool Equals(YtDlpClientSettings? other) =>
@@ -60,11 +64,13 @@ public class YtDlpClientSettings : YtDlpSettings, IProviderConfig, IEquatable<Yt
         Reencode == other.Reencode &&
         MinDownloadDelaySeconds == other.MinDownloadDelaySeconds &&
         MaxDownloadDelaySeconds == other.MaxDownloadDelaySeconds &&
-        DownloadPath == other.DownloadPath;
+        DownloadPath == other.DownloadPath &&
+        FailOnPartial == other.FailOnPartial;
 
     public override bool Equals(object? obj) => obj is YtDlpClientSettings other && Equals(other);
 
     public override int GetHashCode() => HashCode.Combine(
-        YtDlpPath, AdditionalArgs, UseSponsorBlock, SponsorBlockApiEndpoint,
-        Reencode, MinDownloadDelaySeconds, MaxDownloadDelaySeconds, DownloadPath);
+        HashCode.Combine(YtDlpPath, AdditionalArgs, UseSponsorBlock, SponsorBlockApiEndpoint,
+            Reencode, MinDownloadDelaySeconds, MaxDownloadDelaySeconds, DownloadPath),
+        FailOnPartial);
 }
